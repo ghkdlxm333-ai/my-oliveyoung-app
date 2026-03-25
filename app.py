@@ -19,7 +19,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("💡 자동 부분 할당 및 재고 차감 적용")
-    st.caption("Developed by Jay")
+    st.caption("TEST중")
 
 # ==========================================
 # 메인 화면 디자인
