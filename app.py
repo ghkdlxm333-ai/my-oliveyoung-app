@@ -4,7 +4,7 @@ import io
 import re
 
 # 1. 페이지 기본 설정 (가장 위에 와야 함)
-st.set_page_config(page_title="올리브영 수주업로드 자동 입력 시스템", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="올리브영 수주업로드 자동 입력 시스템", page_icon="🥑", layout="wide")
 
 # ==========================================
 # 🎨 사이드바 (Sidebar) 디자인: 로고 및 업로드 창
