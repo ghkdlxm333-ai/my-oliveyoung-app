@@ -82,7 +82,6 @@ with st.sidebar:
 # 메인 화면 디자인
 # ==========================================
 st.title("올리브영 수주업로드 자동 입력 시스템")
-st.markdown("Mentholatum : Moving The Heart")
 
 if uploaded_files:
     order_file = None
