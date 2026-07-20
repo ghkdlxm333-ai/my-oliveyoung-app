@@ -1,285 +1,187 @@
-import io
-import pandas as pd
-import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import io
 
-# ==========================================
-# 1. 페이지 기본 설정 및 CSS
-# ==========================================
-st.set_page_config(
-    page_title="올리브영 수주업로드 자동 입력 시스템",
-    page_icon="https://raw.githubusercontent.com/paak1010/mentholatum_oliveyoung/main/logo.png",
-    layout="wide",
-)
+st.set_page_config(page_title="올리브영 자동 매핑 솔루션", layout="wide")
 
-custom_css = """
-<style>
-[data-testid="stHeader"] { visibility: hidden; }
-footer { visibility: hidden; }
-</style>
-"""
-st.markdown(custom_css, unsafe_allow_html=True)
+st.title("📦 올리브영 발주 - WMS 재고 자동 매핑 시스템")
+st.caption("1년 6개월 이상 잔여 유효기간 & 박스 입수량 이상 재고만 자동 계산하여 단일 LOT를 매핑합니다.")
 
-# GitHub Raw 양식 URL (레포지토리에 올리신 서식파일)
-TEMPLATE_URL = "https://raw.githubusercontent.com/paak1010/mentholatum_oliveyoung/main/%EC%98%AC%EB%A6%AC%EB%B8%8C%EC%96%81%20%EC%84%9C%EC%8B%9D%ED%8C%8C%EC%9D%BC(Final)_New%20System%20260720%20%EC%96%91%EC%A7%80%201%20(1).xlsx"
+# ---------------------------------------------------------
+# Sidebar File Upload
+# ---------------------------------------------------------
+st.sidebar.header("📁 엑셀 파일 업로드")
+stock_file = st.sidebar.file_uploader("1. WMS 일일재고 파일 (.xlsx)", type=["xlsx"])
+order_file = st.sidebar.file_uploader("2. 올리브영 납품확인서 목록 (.xlsx)", type=["xlsx"])
 
+# Delivery Center Code Mapping
+CENTER_MAP = {
+    '[LA02] 양지센터': '86101126',
+    '[L002] 부곡센터': '86100086',
+    '[L003] 중부센터': '86100118',
+    '[L001] 수도권센터': '86100000' # 필요시 확장 가능
+}
 
-@st.cache_data
-def load_template():
-  """GitHub에서 올리브영 표준 양식 및 매핑 테이블 로드"""
-  try:
-    response = requests.get(TEMPLATE_URL)
-    xls = pd.ExcelFile(io.BytesIO(response.content))
-    df_tpl = pd.read_excel(xls, sheet_name="서식(수주업로드)", header=0)
-    df_deliv = pd.read_excel(xls, sheet_name="배송처")
-    df_prod = pd.read_excel(xls, sheet_name="제품명")
-    return df_tpl, df_deliv, df_prod
-  except Exception as e:
-    st.error(
-        f"GitHub 양식 파일을 불러오는데 실패했습니다: {e}\n(파일명/경로를 확인해주세요)"
-    )
-    return None, None, None
+# ---------------------------------------------------------
+# Processing Logic
+# ---------------------------------------------------------
+if stock_file and order_file:
+    try:
+        # Load Raw Data
+        df_stock_raw = pd.read_excel(stock_file, header=None)
+        df_order_raw = pd.read_excel(order_file, header=None)
+        
+        # Parse Stock Data Header (Row 0/1 area)
+        stock_header_idx = 0
+        for i, row in df_stock_raw.iterrows():
+            if '상품코드' in row.values or '상품' in row.values:
+                stock_header_idx = i
+                break
+        
+        df_stock = pd.read_excel(stock_file, header=stock_header_idx)
+        df_stock.columns = [str(c).strip() for c in df_stock.columns]
+        
+        # Parse Order Data Header
+        order_header_idx = 0
+        for i, row in df_order_raw.iterrows():
+            if '상품코드' in row.values:
+                order_header_idx = i
+                break
+        
+        df_order = pd.read_excel(order_file, header=order_header_idx)
+        df_order.columns = [str(c).strip() for c in df_order.columns]
+        
+        # Preprocessing Barcodes & Clean strings (Force clean string without .0)
+        df_stock['상품코드_str'] = df_stock['상품코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
+        df_stock['상품바코드_str'] = df_stock['상품바코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
+        df_order['상품코드_str'] = df_order['상품코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
+        
+        # Parse Dates
+        df_stock['유효일자'] = pd.to_datetime(df_stock['유효일자'], errors='coerce')
+        df_order['입고예정일'] = pd.to_datetime(df_order['입고예정일'], errors='coerce')
+        
+        # Preprocessing Numbers
+        df_stock['합계수량'] = pd.to_numeric(df_stock['합계수량'], errors='coerce').fillna(0)
+        df_stock['입수량(BOX)'] = pd.to_numeric(df_stock['입수량(BOX)'], errors='coerce').fillna(1)
+        
+        df_order['발주수량\n(EA)'] = pd.to_numeric(df_order['발주수량\n(EA)'], errors='coerce').fillna(0)
+        df_order['BOX\n입수'] = pd.to_numeric(df_order['BOX\n입수'], errors='coerce').fillna(1)
+        
+        mapped_rows = []
+        review_rows = []
+        
+        today = datetime.now()
+        
+        # Process Mapping Loop
+        for idx, row in df_order.iterrows():
+            barcode = row['상품코드_str']
+            order_qty = row['발주수량\n(EA)']
+            box_in_qty = row['BOX\n입수']
+            order_date = row['입고예정일'] if pd.notnull(row['입고예정일']) else today
+            center_name = str(row.get('센터', ''))
+            
+            # Find Matching Stock (Match by Barcode or ME Code)
+            stock_sub = df_stock[
+                (df_stock['상품바코드_str'] == barcode) | 
+                (df_stock['상품코드_str'] == barcode)
+            ].copy()
+            
+            # 🛑 [제약 1] 유효기간 1년 6개월(547.5일) 이상 남은 재고만 선별
+            # 기준일: 오늘 또는 입고예정일
+            min_valid_date = order_date + timedelta(days=547)
+            valid_stock = stock_sub[stock_sub['유효일자'] >= min_valid_date].copy()
+            
+            # 🛑 [제약 2] 재고 수량이 박스 입수량보다 적은 재고(단수) 차단
+            # 재고 수량이 입수량(BOX) 이상인 것만 허용
+            valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량(BOX)']]
+            
+            # FEFO 정렬 (유효일자 임박순)
+            valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
+            
+            selected_lot = ""
+            selected_exp_date = ""
+            status_msg = "정상"
+            me_code = ""
+            
+            if not valid_stock.empty:
+                me_code = valid_stock.iloc[0]['상품코드']
+                
+                # FEFO 첫 번째 LOT 수량이 충분한가?
+                fefo_match = valid_stock[valid_stock['합계수량'] >= order_qty]
+                
+                if not fefo_match.empty:
+                    # 단일 LOT로 전량 커버 가능
+                    best_lot = fefo_match.iloc[0]
+                    selected_lot = best_lot['화주LOT']
+                    selected_exp_date = best_lot['유효일자'].strftime('%Y-%m-%d') if pd.notnull(best_lot['유효일자']) else ""
+                else:
+                    # 유효재고 전체 합산하여 총량 확인
+                    total_avail_qty = valid_stock['합계수량'].sum()
+                    if total_avail_qty >= order_qty:
+                        status_msg = "🔴 경고: 단일 LOT 수량 부족 (LOT 분할 필요)"
+                    else:
+                        status_msg = "🔴 경고: 출고가능 유효재고 부족 (1.5년 미만/단수제외 후 부족)"
+            else:
+                status_msg = "🔴 경고: 출고 가능한 재고 없음 (1년 6개월 미만 또는 박스 미만 재고)"
+                
+            # 배송코드 매핑
+            shipping_code = CENTER_MAP.get(center_name, '')
+            
+            # 결과 행 구성 (서식(수주업로드) 형태)
+            out_row = {
+                '발주처코드': '86100000',
+                '입고예정일': order_date.strftime('%Y-%m-%d') if pd.notnull(order_date) else '',
+                '배송코드': shipping_code,
+                'ORDER #': row.get('입고전표', ''),
+                '상품명': row.get('상품명', ''),
+                '바코드': barcode,
+                'MECODE': me_code,
+                '수량': order_qty,
+                '발주원가': row.get('원단가', 0),
+                '발주금액': row.get('원가금액', 0),
+                'LOT': selected_lot,
+                '유효일자': selected_exp_date,
+                '매핑상태': status_msg
+            }
+            
+            if selected_lot != "" and status_msg == "정상":
+                mapped_rows.append(out_row)
+            else:
+                review_rows.append(out_row)
+                
+        df_success = pd.DataFrame(mapped_rows)
+        df_review = pd.DataFrame(review_rows)
+        
+        # ---------------------------------------------------------
+        # Display Results
+        # ---------------------------------------------------------
+        col1, col2 = st.columns(2)
+        col1.metric("🟢 정상 매핑 성공 건수", len(df_success))
+        col2.metric("🔴 예외/검토 필요 건수", len(df_review))
+        
+        tab1, tab2 = st.tabs(["🟢 자동 매핑 완료 목록", "🔴 수기 검토 필요 목록 (제약 미달 / 재고 쪼개짐)"])
+        
+        with tab1:
+            st.dataframe(df_success, use_container_width=True)
+            if not df_success.empty:
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_success.to_excel(writer, index=False, sheet_name='서식(수주업로드)')
+                st.download_button(
+                    label="📥 완료된 수주업로드 엑셀 다운로드",
+                    data=output.getvalue(),
+                    file_name=f"올리브영_수주업로드_완료_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+        with tab2:
+            st.dataframe(df_review, use_container_width=True)
+            if not df_review.empty:
+                st.warning("⚠️ 위 건들은 1년 6개월 미만 유효일자 재고, 박스 입수량 미만 재고, 또는 단일 LOT 수량 부족 건입니다. 재고를 수기 확인해주세요.")
 
-
-def to_safe_float(series):
-  """전처리용: 숫자 이외 문자 제거 후 float 변환"""
-  cleaned = series.astype(str).str.replace(r"[^0-9.]", "", regex=True)
-  return pd.to_numeric(cleaned, errors="coerce").fillna(0)
-
-
-# ==========================================
-# 2. 메인 화면 UI (2개 파일 업로드)
-# ==========================================
-st.title("올리브영 수주업로드 자동 입력 시스템")
-st.markdown("---")
-
-col1, col2 = st.columns(2)
-
-with col1:
-  uploaded_inv_file = st.file_uploader(
-      "📁 [1] 일일재고 파일 업로드 (.xlsx)", type=["xlsx"], key="inv_file"
-  )
-
-with col2:
-  uploaded_order_file = st.file_uploader(
-      "📁 [2] 올리브영 발주(Raw) 파일 업로드 (.xlsx)",
-      type=["xlsx"],
-      key="order_file",
-  )
-
-st.caption("💡 자동 부분 할당 및 재고 차감 적용 | ✔️ 잔여 유효일자 548일 이하 제외")
-st.markdown("---")
-
-# ==========================================
-# 3. 데이터 처리 및 자동 할당 로직
-# ==========================================
-if uploaded_inv_file and uploaded_order_file:
-  try:
-    df_tpl_raw, df_deliv, df_prod = load_template()
-
-    if df_tpl_raw is not None:
-      # Raw 발주 및 일일재고 파일 읽기
-      df_order_raw = pd.read_excel(uploaded_order_file)
-      df_inv_raw = pd.read_excel(uploaded_inv_file)
-
-      # ------------------------------------
-      # A. 배송처 및 상품 코드(MECODE) 매핑
-      # ------------------------------------
-      df_order = df_order_raw.copy()
-
-      # 바코드 정제 (소수점 제거)
-      df_order["상품코드"] = (
-          df_order["상품코드"].astype(str).str.split(".").str[0].str.strip()
-      )
-
-      # 배송코드 매핑 (센터명 기준)
-      deliv_dict = dict(zip(df_deliv["배송처"], df_deliv["배송코드"]))
-      df_order["배송코드"] = df_order["센터"].map(deliv_dict)
-
-      # MECODE 및 단가 매핑 (제품명 시트 기준)
-      df_prod["상품명_clean"] = (
-          df_prod["상품명 "].astype(str).str.split(".").str[0].str.strip()
-      )
-      mecode_dict = dict(zip(df_prod["상품명_clean"], df_prod["상품코드"]))
-      df_order["MECODE"] = df_order["상품코드"].map(mecode_dict)
-
-      # ------------------------------------
-      # B. 재고 시트 정제
-      # ------------------------------------
-      df_inv = df_inv_raw.copy()
-
-      # 컬럼명 표준화
-      rename_dict = {}
-      for col in df_inv.columns:
-        col_str = str(col).replace(" ", "").upper()
-        if "상품" in col_str and "상품명" not in col_str:
-          rename_dict[col] = "상품"
-        elif "LOT" in col_str:
-          rename_dict[col] = "화주LOT"
-        elif "유효일자" in col_str or "유통기한" in col_str:
-          rename_dict[col] = "유효일자"
-        elif "환산" in col_str:
-          rename_dict[col] = "환산"
-
-      df_inv.rename(columns=rename_dict, inplace=True)
-
-      df_inv["상품"] = df_inv["상품"].astype(str).str.strip().str.upper()
-      df_inv["환산"] = to_safe_float(df_inv["환산"]).astype(float)
-
-      # 유효일자 및 소비기한(548일 이하) 필터링
-      df_inv["유효일자_DT"] = pd.to_datetime(
-          df_inv["유효일자"], errors="coerce"
-      )
-      df_inv["유효일자_보존"] = df_inv["유효일자_DT"].fillna(
-          pd.Timestamp("2099-12-31")
-      )
-      df_inv["유효일자_STR"] = (
-          df_inv["유효일자_DT"].dt.strftime("%Y-%m-%d").fillna("")
-      )
-
-      today = pd.Timestamp.today().normalize()
-      cutoff_date = today + pd.Timedelta(days=548)
-      idx_short_shelf = df_inv["유효일자_보존"] <= cutoff_date
-      idx_oc2 = (df_inv["상품"] == "ME90621OC2") & (
-          ~df_inv["화주LOT"].astype(str).str.contains("분리배출")
-      )
-
-      df_inv_valid = df_inv[~(idx_oc2 | idx_short_shelf)].copy()
-      df_inv_valid["화주LOT"] = df_inv_valid["화주LOT"].astype(str)
-
-      # 박스 입수량 파악
-      box_col_candidates = [
-          col
-          for col in df_inv.columns
-          if "BOX" in str(col).upper() or "입수량" in str(col)
-      ]
-      box_col_name = box_col_candidates[0] if box_col_candidates else None
-      product_box_unit = {}
-      if box_col_name:
-        for mecode, group in df_inv.groupby("상품"):
-          box_vals = to_safe_float(group[box_col_name])
-          box_vals = box_vals[box_vals > 0]
-          if not box_vals.empty:
-            product_box_unit[mecode] = int(box_vals.min())
-
-      # 재고 그룹화
-      if not df_inv_valid.empty:
-        inv_grouped = (
-            df_inv_valid.groupby(["상품", "유효일자_보존"])
-            .agg({"환산": "sum", "화주LOT": "first", "유효일자_STR": "first"})
-            .reset_index()
-        )
-      else:
-        inv_grouped = pd.DataFrame(
-            columns=["상품", "유효일자_보존", "환산", "화주LOT", "유효일자_STR"]
-        )
-
-      # ------------------------------------
-      # C. 자동 할당 매칭
-      # ------------------------------------
-      df_order["발주수량\n(EA)"] = to_safe_float(df_order["발주수량\n(EA)"])
-      df_order["LOT"] = ""
-      df_order["유효일자_결과"] = ""
-      df_order["할당상태"] = ""
-
-      with st.spinner("재고 매칭 및 자동 수주 업로드 서식 작성 중..."):
-        for i, row in df_order.iterrows():
-          mecode = str(row["MECODE"])
-          order_qty = float(row["발주수량\n(EA)"])
-
-          if mecode in ["NAN", "", "NONE"] or order_qty <= 0:
-            df_order.at[i, "할당상태"] = "제외"
-            continue
-
-          available_inv = inv_grouped[
-              (inv_grouped["상품"] == mecode) & (inv_grouped["환산"] > 0)
-          ]
-
-          if available_inv.empty:
-            (
-                df_order.at[i, "LOT"],
-                df_order.at[i, "유효일자_결과"],
-                df_order.at[i, "할당상태"],
-            ) = ("재고없음", "재고없음", "재고없음")
-            continue
-
-          full_match = available_inv[available_inv["환산"] >= order_qty]
-          best_match = (
-              full_match.sort_values(by="유효일자_보존").iloc[0]
-              if not full_match.empty
-              else available_inv.sort_values(by="유효일자_보존").iloc[0]
-          )
-
-          best_idx = best_match.name
-          max_qty = float(best_match["환산"])
-          lot_str = str(best_match["화주LOT"])
-          date_str = str(best_match["유효일자_STR"])
-
-          box_unit = product_box_unit.get(mecode, 1)
-          potential_qty = min(order_qty, max_qty)
-          allocated_boxes = int(potential_qty // box_unit)
-          allocated_qty = float(allocated_boxes * box_unit)
-
-          if allocated_qty > 0:
-            df_order.at[i, "발주수량\n(EA)"] = allocated_qty
-            df_order.at[i, "LOT"] = lot_str
-            df_order.at[i, "유효일자_결과"] = date_str
-            df_order.at[i, "할당상태"] = (
-                "정상할당"
-                if allocated_qty == order_qty
-                else f"부분할당({allocated_boxes}BOX)"
-            )
-            inv_grouped.at[best_idx, "환산"] -= allocated_qty
-          else:
-            df_order.at[i, "할당상태"] = "박스단위부족"
-
-      # ------------------------------------
-      # D. 최종 올리브영 서식(수주업로드) 데이터 생성
-      # ------------------------------------
-      final_df = pd.DataFrame()
-      final_df["발주처코드"] = 86100000
-      final_df["입고예정일"] = df_order["입고예정일"]
-      final_df["배송코드"] = df_order["배송코드"]
-      final_df["ORDER #"] = df_order["입고전표"]
-      final_df["상품명"] = df_order["상품명"]
-      final_df["바코드"] = df_order["상품코드"]
-      final_df["MECODE"] = df_order["MECODE"]
-      final_df["수량"] = df_order["발주수량\n(EA)"]
-      final_df["발주원가"] = df_order["원단가"]
-      final_df["발주금액"] = df_order["원가금액"]
-      final_df["LOT"] = df_order["LOT"]
-      final_df["유효일자"] = df_order["유효일자_결과"]
-      final_df["할당상태"] = df_order["할당상태"]
-
-      # ------------------------------------
-      # E. 결과 화면 및 다운로드
-      # ------------------------------------
-      st.success("🎉 올리브영 서식 변환 및 자동 재고 할당이 완료되었습니다!")
-
-      st.subheader("📊 작성된 수주업로드 양식 미리보기")
-      st.dataframe(final_df.head(100), use_container_width=True, hide_index=True)
-
-      # 엑셀 다운로드 파일 생성
-      buffer = io.BytesIO()
-      with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        final_df.to_excel(writer, index=False, sheet_name="서식(수주업로드)")
-        workbook = writer.book
-        worksheet = writer.sheets["서식(수주업로드)"]
-        text_format = workbook.add_format({"num_format": "@"})
-
-        # 바코드, 배송코드, 날짜 열을 문자열(텍스트) 포맷 처리
-        for target_col in ["발주처코드", "배송코드", "바코드", "유효일자"]:
-          if target_col in final_df.columns:
-            idx = final_df.columns.get_loc(target_col)
-            worksheet.set_column(idx, idx, 15, text_format)
-
-      st.download_button(
-          label="💾 완성된 올리브영 수주업로드 엑셀 다운로드",
-          data=buffer.getvalue(),
-          file_name="올리브영_수주업로드_완성본.xlsx",
-          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          type="primary",
-      )
-
-  except Exception as e:
-    st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
+    except Exception as e:
+        st.error(f"처리 중 오류가 발생했습니다: {e}")
+else:
+    st.info("👈 좌측 사이드바에 '일일재고'와 '납품확인서 목록' 엑셀 파일을 올려주세요.")
