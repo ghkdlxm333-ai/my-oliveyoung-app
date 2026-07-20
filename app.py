@@ -10,9 +10,9 @@ import io
 st.set_page_config(page_title="올리브영 수주 매핑 자동화", layout="wide")
 
 st.title("📦 올리브영 발주 - 3PL WMS 일일재고 자동 매핑 솔루션")
-st.caption("1년 6개월 이상 잔여 유효기간 & 박스 입수량 이상 재고만 자동 계산하여 단일 LOT를 매핑합니다.")
+st.caption("검토필요 항목도 ME코드 및 기본 정보를 정상 매핑하여 출력합니다.")
 
-# 센터명 -> 배송코드 매핑 사전 (이미지 기반 최신화)
+# 센터명 -> 배송코드 매핑 사전
 CENTER_MAP = {
     '[L002] 부곡센터': '86100086',
     '[L003] 중부센터': '86100118',
@@ -34,15 +34,11 @@ order_file = st.sidebar.file_uploader("2. 올리브영 납품확인서 목록 (.
 if stock_file and order_file:
     try:
         # =========================================================
-        # 1. 일일재고 파일 읽기 (D열 및 인덱스 위치 기반 파싱)
+        # 1. 일일재고 파일 읽기
         # =========================================================
         df_stock_raw = pd.read_excel(stock_file, header=None)
-        
-        # 데이터는 3번째 행(인덱스 2)부터 시작
         df_stock = df_stock_raw.iloc[2:].copy()
         
-        # Col 3: D열 (ME상품코드), Col 6: G열 (화주LOT), Col 13: N열 (유효일자),
-        # Col 17: R열 (입수량(BOX)), Col 31: AF열 (합계수량), Col 33: AH열 (상품바코드)
         stock_data = pd.DataFrame({
             'ME코드': df_stock[3].astype(str).str.strip(),
             '화주LOT': df_stock[6].astype(str).str.strip(),
@@ -66,14 +62,17 @@ if stock_file and order_file:
         df_order = pd.read_excel(order_file, header=order_header_idx)
         df_order.columns = [str(c).strip() for c in df_order.columns]
         
-        # 🛑 [수정 1] 상품명이 없거나 None인 빈 행은 완전히 필터링
+        # 상품명이 없거나 빈 행은 제외
         df_order = df_order[df_order['상품명'].notna() & (df_order['상품명'].astype(str).str.strip() != '')].copy()
         
         df_order['상품코드_str'] = df_order['상품코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
         df_order['입고예정일'] = pd.to_datetime(df_order['입고예정일'], errors='coerce')
         df_order['발주수량\n(EA)'] = pd.to_numeric(df_order['발주수량\n(EA)'], errors='coerce').fillna(0).astype(int)
         df_order['원단가'] = pd.to_numeric(df_order.get('원단가', 0), errors='coerce').fillna(0).astype(int)
+        
+        # 원가금액이 없거나 0인 경우 단가 * 수량으로 계산
         df_order['원가금액'] = pd.to_numeric(df_order.get('원가금액', 0), errors='coerce').fillna(0).astype(int)
+        df_order['원가금액'] = np.where(df_order['원가금액'] == 0, df_order['원단가'] * df_order['발주수량\n(EA)'], df_order['원가금액'])
         
         # =========================================================
         # 3. 매핑 및 출고 제약조건 처리
@@ -89,35 +88,40 @@ if stock_file and order_file:
             unit_price = int(row.get('원단가', 0))
             total_amount = int(row.get('원가금액', 0))
             
-            # 1) 바코드 또는 ME코드로 재고 탐색
-            sub_stock = stock_data[
+            # 1) 바코드 또는 ME코드로 전체 재고 탐색 (필터링 전 원본)
+            sub_stock_all = stock_data[
                 (stock_data['상품바코드'] == barcode) | 
                 (stock_data['ME코드'] == barcode)
             ].copy()
             
-            # 2) 🛑 [제약 1] 유효기간 1년 6개월(547일) 미만 재고 차단
-            min_valid_date = order_date + timedelta(days=547)
-            valid_stock = sub_stock[sub_stock['유효일자'] >= min_valid_date].copy()
+            # 🛑 [핵심 수정] 재고 유무와 상관없이 원본 데이터에서 ME코드 우선 추출
+            me_code = ""
+            if not sub_stock_all.empty:
+                me_code = sub_stock_all.iloc[0]['ME코드']
             
-            # 3) 🛑 [제약 2] 박스 입수량 미만 재고(단수 재고) 차단
+            # 2) 출고 가능 조건 필터링
+            # 1년 6개월(547일) 이상 남은 재고
+            min_valid_date = order_date + timedelta(days=547)
+            valid_stock = sub_stock_all[sub_stock_all['유효일자'] >= min_valid_date].copy()
+            
+            # 박스 입수량 미만 재고 제외
             valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량_BOX']]
             
-            # 4) FEFO 정렬
+            # FEFO 정렬
             valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
             
             selected_lot = ""
             selected_exp_date = ""
             status_msg = "정상"
-            me_code = ""
             
             if not valid_stock.empty:
-                me_code = valid_stock.iloc[0]['ME코드']
                 fefo_match = valid_stock[valid_stock['합계수량'] >= order_qty]
                 
                 if not fefo_match.empty:
                     best_lot = fefo_match.iloc[0]
                     selected_lot = best_lot['화주LOT']
-                    selected_exp_date = best_lot['유효일자'].strftime('%Y%m%d') if pd.notnull(best_lot['유효일자']) else ""
+                    if pd.notnull(best_lot['유효일자']):
+                        selected_exp_date = best_lot['유효일자'].strftime('%Y%m%d')
                 else:
                     total_avail_qty = valid_stock['합계수량'].sum()
                     if total_avail_qty >= order_qty:
@@ -127,10 +131,8 @@ if stock_file and order_file:
             else:
                 status_msg = "검토필요 (출고가능 재고없음)"
                 
-            # 🛑 [수정 2] 사진 기반 최신 센터 배송코드 매칭
             shipping_code = CENTER_MAP.get(center_name, '')
             
-            # 🛑 [수정 3 & 4] 날짜 YYYYMMDD 포맷 & 정수형 소수점 제거
             out_row = {
                 '입고예정일': order_date.strftime('%Y%m%d') if pd.notnull(order_date) else '',
                 '발주처코드': '86100000',
@@ -150,7 +152,7 @@ if stock_file and order_file:
         df_result = pd.DataFrame(results)
         
         # =========================================================
-        # 4. 결과 지표 및 표 하이라이팅 연출
+        # 4. 결과 출력
         # =========================================================
         normal_cnt = (df_result['매핑상태'] == '정상').sum()
         review_cnt = len(df_result) - normal_cnt
@@ -162,17 +164,15 @@ if stock_file and order_file:
         
         st.subheader("📋 수주 매핑 최종 결과 목록")
         
-        # 스타일 지정 함수 (검토필요 항목 강조)
         def highlight_review(row):
             if '검토필요' in str(row['매핑상태']):
                 return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
             return [''] * len(row)
             
         styled_df = df_result.style.apply(highlight_review, axis=1)
-        
         st.dataframe(styled_df, use_container_width=True)
         
-        # 엑셀 다운로드 버튼
+        # 엑셀 다운로드
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df_result.to_excel(writer, index=False, sheet_name='서식(수주업로드)')
