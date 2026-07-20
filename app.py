@@ -12,12 +12,13 @@ st.set_page_config(page_title="올리브영 수주 매핑 자동화", layout="wi
 st.title("📦 올리브영 발주 - 3PL WMS 일일재고 자동 매핑 솔루션")
 st.caption("1년 6개월 이상 잔여 유효기간 & 박스 입수량 이상 재고만 자동 계산하여 단일 LOT를 매핑합니다.")
 
-# 센터명 -> 배송코드 매핑 사전
+# 센터명 -> 배송코드 매핑 사전 (이미지 기반 최신화)
 CENTER_MAP = {
-    '[LA02] 양지센터': '86101126',
     '[L002] 부곡센터': '86100086',
     '[L003] 중부센터': '86100118',
-    '[L001] 수도권센터': '86100000'
+    '[LA04] 양지온라인센터': '86101125',
+    '[LA02] 양지센터': '86101126',
+    '[LA0A] 경산센터': '81032980'
 }
 
 # ---------------------------------------------------------
@@ -65,11 +66,14 @@ if stock_file and order_file:
         df_order = pd.read_excel(order_file, header=order_header_idx)
         df_order.columns = [str(c).strip() for c in df_order.columns]
         
+        # 🛑 [수정 1] 상품명이 없거나 None인 빈 행은 완전히 필터링
+        df_order = df_order[df_order['상품명'].notna() & (df_order['상품명'].astype(str).str.strip() != '')].copy()
+        
         df_order['상품코드_str'] = df_order['상품코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
         df_order['입고예정일'] = pd.to_datetime(df_order['입고예정일'], errors='coerce')
-        df_order['발주수량\n(EA)'] = pd.to_numeric(df_order['발주수량\n(EA)'], errors='coerce').fillna(0)
-        df_order['원단가'] = pd.to_numeric(df_order.get('원단가', 0), errors='coerce').fillna(0)
-        df_order['원가금액'] = pd.to_numeric(df_order.get('원가금액', 0), errors='coerce').fillna(0)
+        df_order['발주수량\n(EA)'] = pd.to_numeric(df_order['발주수량\n(EA)'], errors='coerce').fillna(0).astype(int)
+        df_order['원단가'] = pd.to_numeric(df_order.get('원단가', 0), errors='coerce').fillna(0).astype(int)
+        df_order['원가금액'] = pd.to_numeric(df_order.get('원가금액', 0), errors='coerce').fillna(0).astype(int)
         
         # =========================================================
         # 3. 매핑 및 출고 제약조건 처리
@@ -79,11 +83,11 @@ if stock_file and order_file:
         
         for idx, row in df_order.iterrows():
             barcode = row['상품코드_str']
-            order_qty = row['발주수량\n(EA)']
+            order_qty = int(row['발주수량\n(EA)'])
             order_date = row['입고예정일'] if pd.notnull(row['입고예정일']) else today
-            center_name = str(row.get('센터', ''))
-            unit_price = row.get('원단가', 0)
-            total_amount = row.get('원가금액', 0)
+            center_name = str(row.get('센터', '')).strip()
+            unit_price = int(row.get('원단가', 0))
+            total_amount = int(row.get('원가금액', 0))
             
             # 1) 바코드 또는 ME코드로 재고 탐색
             sub_stock = stock_data[
@@ -113,7 +117,7 @@ if stock_file and order_file:
                 if not fefo_match.empty:
                     best_lot = fefo_match.iloc[0]
                     selected_lot = best_lot['화주LOT']
-                    selected_exp_date = best_lot['유효일자'].strftime('%Y-%m-%d') if pd.notnull(best_lot['유효일자']) else ""
+                    selected_exp_date = best_lot['유효일자'].strftime('%Y%m%d') if pd.notnull(best_lot['유효일자']) else ""
                 else:
                     total_avail_qty = valid_stock['합계수량'].sum()
                     if total_avail_qty >= order_qty:
@@ -123,11 +127,12 @@ if stock_file and order_file:
             else:
                 status_msg = "검토필요 (출고가능 재고없음)"
                 
+            # 🛑 [수정 2] 사진 기반 최신 센터 배송코드 매칭
             shipping_code = CENTER_MAP.get(center_name, '')
             
-            # 요청하신 지정 순서대로 dict 생성
+            # 🛑 [수정 3 & 4] 날짜 YYYYMMDD 포맷 & 정수형 소수점 제거
             out_row = {
-                '입고예정일': order_date.strftime('%Y-%m-%d') if pd.notnull(order_date) else '',
+                '입고예정일': order_date.strftime('%Y%m%d') if pd.notnull(order_date) else '',
                 '발주처코드': '86100000',
                 '배송코드': shipping_code,
                 'MEcode': me_code,
