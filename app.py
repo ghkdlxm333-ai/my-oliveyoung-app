@@ -73,31 +73,31 @@ st.markdown("Mentholatum : Moving The Heart")
 if order_file and inv_file:
     try:
         # ------------------------------------------
-        # 1. 일일재고 데이터 로드 및 정제
+        # 1. 일일재고 데이터 로드 및 정제 (중복 컬럼 방지 적용)
         # ------------------------------------------
         df_inv_raw = pd.read_excel(inv_file, header=0)
-        # 헤더 위치 자동 감지 (1번 행이 헤더인 경우 처리)
-        if '상품' not in df_inv_raw.columns and '순번' in df_inv_raw.iloc[0].values:
-            df_inv_raw = pd.read_excel(inv_file, header=1)
+        
+        # 첫 번째 행이 불필요한 반복 헤더인 경우 처리
+        if len(df_inv_raw) > 0 and str(df_inv_raw.iloc[0]['순번']).strip() == '순번':
+            df_inv_raw = df_inv_raw.iloc[1:].reset_index(drop=True)
 
         df_inv = df_inv_raw.copy()
 
-        # 재고 컬럼 매핑
+        # 정밀한 열 매핑 (중복 매핑 완벽 방지)
         inv_col_map = {}
         for c in df_inv.columns:
-            c_str = str(c).replace(" ", "").upper()
-            if c_str == '상품':
+            c_clean = str(c).replace(" ", "").upper()
+            if c_clean == '상품':
                 inv_col_map[c] = '상품'
-            elif 'LOT' in c_str:
+            elif c_clean == '화주LOT':
                 inv_col_map[c] = '화주LOT'
-            elif '유효' in c_str or '유통' in c_str:
+            elif c_clean == '유효일자':
                 inv_col_map[c] = '유효일자'
-            elif '합계' in c_str or '환산' in c_str or '수량' in c_str:
-                if '합계수량' in c_str or '환산' in c_str:
-                    inv_col_map[c] = '환산'
-            elif '상품바코드' in c_str or '바코드' in c_str:
+            elif c_clean in ['합계수량', '환산']:
+                inv_col_map[c] = '환산'
+            elif c_clean == '상품바코드':
                 inv_col_map[c] = '상품바코드'
-            elif 'BOX' in c_str or '입수' in c_str:
+            elif c_clean in ['입수량(BOX)', 'BOX입수량']:
                 inv_col_map[c] = '입수량(BOX)'
 
         df_inv.rename(columns=inv_col_map, inplace=True)
@@ -177,7 +177,7 @@ if order_file and inv_file:
         today = pd.Timestamp.today().normalize()
         cutoff_date = today + pd.Timedelta(days=548)
         idx_short_life = (df_inv['유효일자_보존'] <= cutoff_date)
-        idx_oc2 = (df_inv['상품'] == 'ME90621OC2') & (~df_inv['화주LOT'].astype(str).str.contains('분리배출'))
+        idx_oc2 = (df_inv['상품'] == 'ME90621OC2') & (~df_inv['화주LOT'].astype(str).str.contains('분리배출', na=False))
 
         df_inv_valid = df_inv[~(idx_oc2 | idx_short_life)].copy()
 
