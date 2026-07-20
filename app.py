@@ -18,14 +18,17 @@ with col2:
 if file_order and file_inv:
     try:
         # ---------------------------------------------------------
-        # 2. 일일재고 데이터 로드 (무조건 2행 기준: header=1)
+        # 2. 일일재고 데이터 로드 (2행 기준: header=1)
         # ---------------------------------------------------------
         df_inv_raw = pd.read_excel(file_inv, header=1)
         
-        # 컬럼명 전처리 (공백 제거 및 대문자 변환)
+        # 컬럼명 전처리
         df_inv_raw.columns = [str(col).strip() for col in df_inv_raw.columns]
         
-        # 첫 번째 데이터 행이 헤더 텍스트의 잔여물인 경우 제외
+        # [오류 방지 핵심] 중복 컬럼명 제거 (첫 번째로 등장하는 컬럼만 유지)
+        df_inv_raw = df_inv_raw.loc[:, ~df_inv_raw.columns.duplicated(keep='first')]
+        
+        # 데이터 첫 행이 잔여 헤더 텍스트인 경우 제거
         if not df_inv_raw.empty and str(df_inv_raw.iloc[0].get('순번', '')).strip() == '순번':
             df_inv_raw = df_inv_raw.iloc[1:].reset_index(drop=True)
             
@@ -49,13 +52,16 @@ if file_order and file_inv:
                 inv_col_map[c] = '입수량(BOX)'
 
         df_inv = df_inv.rename(columns=inv_col_map)
+        
+        # 매핑 후에도 혹시 생겼을 수 있는 중복 컬럼 재제거
+        df_inv = df_inv.loc[:, ~df_inv.columns.duplicated(keep='first')]
 
         # 필수 컬럼 검증
         if '상품' not in df_inv.columns:
             st.error("일일재고 파일의 2행에서 '상품' 컬럼을 찾을 수 없습니다. 컬럼명을 확인해 주세요.")
             st.stop()
 
-        # 데이터 기본 정제
+        # 데이터 기본 정제 및 형변환 (이제 1차원 Series로 전달되므로 오류가 나지 않습니다)
         df_inv['상품'] = df_inv['상품'].astype(str).str.strip().str.upper()
         df_inv['화주LOT'] = df_inv['화주LOT'].astype(str).str.strip()
         df_inv['환산'] = pd.to_numeric(df_inv['환산'], errors='coerce').fillna(0)
@@ -65,7 +71,7 @@ if file_order and file_inv:
         df_inv['유효일자_STR'] = df_inv['유효일자_DT'].dt.strftime('%Y-%m-%d').fillna('')
         df_inv['유효일자_보존'] = df_inv['유효일자_STR']
 
-        # 재고 필터링 조건 (소비기한 1년 6개월 / 548일 이하 및 특정 조건 제외)
+        # 재고 필터링 조건
         today = pd.Timestamp.today().normalize()
         limit_date = today + pd.Timedelta(days=548)
 
@@ -93,15 +99,15 @@ if file_order and file_inv:
         else:
             df_order = pd.read_excel(file_order)
 
-        # 오늘 날짜 강제 적용 (Order Date)
+        # 오늘 날짜 강제 적용
         today_str = datetime.now().strftime('%Y-%m-%d')
-        if '주문일자' in df_order.columns or 'A' in df_order.columns:
+        if '주문일자' in df_order.columns or len(df_order.columns) > 0:
             df_order.iloc[:, 0] = today_str
 
-        st.success("✅ 파일 데이터 로드 및 2행 헤더 정제가 완료되었습니다.")
+        st.success("✅ 파일 데이터 로드 및 중복 헤더 정제가 완료되었습니다.")
 
         # ---------------------------------------------------------
-        # 4. 결과 출력 및 탭 구성 (상세 내역 & 최종 결과)
+        # 4. 결과 출력
         # ---------------------------------------------------------
         tab1, tab2 = st.tabs(["📋 상세 내역", "📊 최종 결과 요약"])
 
