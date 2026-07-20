@@ -45,7 +45,6 @@ with st.sidebar:
     st.markdown("---")
     st.caption("💡 자동 부분 할당 및 재고 차감 적용")
     st.caption("✔️ 잔여 유효일자 548일 이하 제외")
-    st.caption("Developed by Jay")
 
 # ==========================================
 # 메인 화면 디자인
