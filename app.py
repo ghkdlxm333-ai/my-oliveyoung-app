@@ -73,17 +73,16 @@ st.markdown("Mentholatum : Moving The Heart")
 if order_file and inv_file:
     try:
         # ------------------------------------------
-        # 1. 일일재고 데이터 로드 및 정제 (중복 컬럼 방지 적용)
+        # 1. 일일재고 데이터 로드 및 정제
         # ------------------------------------------
         df_inv_raw = pd.read_excel(inv_file, header=0)
         
-        # 첫 번째 행이 불필요한 반복 헤더인 경우 처리
         if len(df_inv_raw) > 0 and str(df_inv_raw.iloc[0]['순번']).strip() == '순번':
             df_inv_raw = df_inv_raw.iloc[1:].reset_index(drop=True)
 
         df_inv = df_inv_raw.copy()
 
-        # 정밀한 열 매핑 (중복 매핑 완벽 방지)
+        # 정밀한 열 매핑 (중복 매핑 방지)
         inv_col_map = {}
         for c in df_inv.columns:
             c_clean = str(c).replace(" ", "").upper()
@@ -102,7 +101,7 @@ if order_file and inv_file:
 
         df_inv.rename(columns=inv_col_map, inplace=True)
 
-        # 재고 기반 바코드 -> MECODE 매핑 테이블 자동 생성
+        # 바코드 -> MECODE 매핑 테이블
         barcode_to_mecode = {}
         if '상품바코드' in df_inv.columns and '상품' in df_inv.columns:
             for _, r in df_inv.iterrows():
@@ -112,17 +111,16 @@ if order_file and inv_file:
                     barcode_to_mecode[bc] = mc
 
         # ------------------------------------------
-        # 2. 올영 주문 데이터(납품확인서 목록) 로드 및 서식 자동 구성
+        # 2. 올영 주문 데이터(납품확인서) 로드 및 서식 생성 (원본 순서 유지를 위해 index 보존)
         # ------------------------------------------
         df_ord_raw = pd.read_excel(order_file)
         
         df_order = pd.DataFrame()
-        df_order['발주처코드'] = '86100000'
+        df_order['orig_idx'] = df_ord_raw.index  # 원본 행 순서 보존용 키
         
-        # 입고예정일 날짜 변환
+        df_order['발주처코드'] = '86100000'
         df_order['입고예정일'] = pd.to_datetime(df_ord_raw['입고예정일'], errors='coerce').dt.strftime('%Y-%m-%d 00:00:00')
         
-        # 배송코드 매핑
         def get_delivery_code(center):
             c_str = str(center)
             for k, v in DELIVERY_CODE_MAP.items():
@@ -134,13 +132,9 @@ if order_file and inv_file:
         df_order['ORDER #'] = ""
         df_order['상품명'] = df_ord_raw['상품명']
         df_order['바코드'] = df_ord_raw['상품코드'].apply(clean_barcode)
-        
-        # 재고 파일에서 추출한 바코드 매핑 적용
         df_order['MECODE'] = df_order['바코드'].map(barcode_to_mecode).fillna("")
-        
         df_order['수량'] = to_safe_float(df_ord_raw['발주수량\n(EA)'])
         
-        # 원단가 및 금액
         unit_price_col = [c for c in df_ord_raw.columns if '원단가' in str(c)]
         if unit_price_col:
             df_order['발주원가'] = to_safe_float(df_ord_raw[unit_price_col[0]])
@@ -149,14 +143,13 @@ if order_file and inv_file:
             df_order['발주원가'] = 0
             df_order['발주금액'] = 0
 
-        # 결과 저장 컬럼 생성
         new_cols = ['LOT', '유효일자', '할당상태', '부족시_최대가능수량', '부족시_LOT', '부족시_유효일자']
         for col in new_cols:
             df_order[col] = ""
             df_order[col] = df_order[col].astype(object)
 
         # ------------------------------------------
-        # 3. 재고 전처리 및 유효일자(548일) 필터링
+        # 3. 재고 전처리 및 548일 필터링
         # ------------------------------------------
         df_inv['상품'] = df_inv['상품'].astype(str).str.strip().str.upper()
         df_inv['환산'] = to_safe_float(df_inv['환산'])
@@ -164,7 +157,6 @@ if order_file and inv_file:
         df_inv['유효일자_보존'] = df_inv['유효일자_DT'].fillna(pd.Timestamp('2099-12-31'))
         df_inv['유효일자_STR'] = df_inv['유효일자_DT'].dt.strftime('%Y-%m-%d 00:00:00').fillna('')
 
-        # 입수량 파싱
         product_box_unit = {}
         if '입수량(BOX)' in df_inv.columns:
             for mecode, group in df_inv.groupby('상품'):
@@ -173,7 +165,6 @@ if order_file and inv_file:
                 if not box_vals.empty:
                     product_box_unit[mecode] = int(box_vals.min())
 
-        # 유효일자 548일 기준 차감
         today = pd.Timestamp.today().normalize()
         cutoff_date = today + pd.Timedelta(days=548)
         idx_short_life = (df_inv['유효일자_보존'] <= cutoff_date)
@@ -191,12 +182,12 @@ if order_file and inv_file:
             inv_grouped = pd.DataFrame(columns=['상품', '유효일자_보존', '환산', '화주LOT', '유효일자_STR'])
 
         # ------------------------------------------
-        # 4. 재고 매칭 및 할당 로직 수행
+        # 4. 재고 매칭 및 할당 (원본 행 순서 보장 순회)
         # ------------------------------------------
         with st.spinner('자동 변환 및 재고 매칭 중...'):
-            for i, row in df_order.iterrows():
-                mecode = str(row['MECODE'])
-                order_qty = float(row['수량'])
+            for i in range(len(df_order)):
+                mecode = str(df_order.at[i, 'MECODE'])
+                order_qty = float(df_order.at[i, '수량'])
 
                 if mecode in ['NAN', '', 'NONE'] or order_qty <= 0:
                     df_order.at[i, '할당상태'] = "MECODE미매핑"
@@ -233,19 +224,23 @@ if order_file and inv_file:
                     df_order.at[i, '부족시_LOT'] = lot_str
                     df_order.at[i, '부족시_유효일자'] = date_str
 
+        # 납품확인서 원본 행 순서 재정렬 및 orig_idx 제거
+        df_order = df_order.sort_values(by='orig_idx').drop(columns=['orig_idx']).reset_index(drop=True)
+
         # ------------------------------------------
         # 5. 결과 화면 출력 및 엑셀 다운로드
         # ------------------------------------------
-        st.success("✅ 주문 원본 파일 자동 변환 및 수주 매핑이 완료되었습니다!")
+        st.success("✅ 주문 원본 순서 유지 및 수주 매핑이 완료되었습니다!")
 
-        st.subheader("📊 서식(수주업로드) 자동 작성 결과 미리보기 (상위 100건)")
+        st.subheader("📊 수주 매핑 결과 미리보기")
         
-        display_cols = ['발주처코드', '입고예정일', '배송코드', '상품명', '바코드', 'MECODE', '수량', '발주원가', '발주금액', 'LOT', '유효일자', '할당상태']
-        existing_cols = [c for c in display_cols if c in df_order.columns]
+        # 요청하신 지정 순서대로 미리보기 컬럼 배치
+        preview_cols = ['MECODE', '상품명', '수량', 'LOT', '유효일자', '할당상태', '발주처코드', '입고예정일', '배송코드', '바코드', '발주원가', '발주금액']
+        existing_preview_cols = [c for c in preview_cols if c in df_order.columns]
         
-        st.dataframe(df_order[existing_cols].head(100), use_container_width=True, hide_index=True)
+        st.dataframe(df_order[existing_preview_cols], use_container_width=True, hide_index=True)
 
-        # 서식 다운로드 생성
+        # 서식 형태 엑셀 다운로드 파일 생성
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
             df_order.to_excel(writer, index=False, sheet_name='서식(수주업로드)')
