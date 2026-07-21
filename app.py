@@ -5,7 +5,7 @@ import os
 import io
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="올리브영 3PL WMS 수주 자동화", layout="wide")
+st.set_page_config(page_title="올리브영 WMS 수주 자동화", layout="wide")
 
 # ---------------------------------------------------------
 # 1. 마스터 파일 연동 설정
@@ -250,7 +250,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         # ---------------------------------------------------------
         # 4. 화면 대시보드 UI 구성
         # ---------------------------------------------------------
-        st.title("📦 3PL WMS 수주 업로드 변환 센터")
+        st.title("🥝 올리브영 수주 자동화 매칭")
 
         total_cnt = len(df_result)
         normal_cnt = len(df_result[df_result['매핑상태'] == '정상'])
