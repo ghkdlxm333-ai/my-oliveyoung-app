@@ -140,7 +140,6 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
             except:
                 total_amount = unit_price * order_qty
 
-            # 📌 부가세 = 합계 * 0.1 (소수점 버림)
             vat_amount = int(total_amount * 0.1)
 
             # 상품코드(MEcode) 매핑
@@ -170,13 +169,11 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
 
                 if not valid_stock.empty:
-                    # 조건 3: 단일 LOT 충족
                     single_lot_match = valid_stock[valid_stock['합계수량'] >= order_qty]
                     if not single_lot_match.empty:
                         best_match = single_lot_match.iloc[0]
                         selected_lot = str(best_match['화주LOT'])
                         if pd.notnull(best_match['유효일자']):
-                            # 📌 유효일자 YYYY-MM-DD 표기
                             selected_exp = best_match['유효일자'].strftime('%Y-%m-%d')
                     else:
                         if valid_stock['합계수량'].sum() >= order_qty:
@@ -186,7 +183,6 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 else:
                     status = "검토필요 (출고가능 재고없음)"
 
-            # WMS 업로드 데이터 구성
             wms_upload_list.append({
                 '출고구분': 0,
                 '수주일자': order_date_str,
@@ -202,18 +198,17 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 '합계': total_amount,
                 '부가세': vat_amount,
                 'LOT': selected_lot,
-                '유효일자': selected_exp, # LOT 옆에 배치될 유효일자
+                '유효일자': selected_exp,
                 '매핑상태': status
             })
 
         df_result = pd.DataFrame(wms_upload_list)
 
         # ---------------------------------------------------------
-        # 4. 효율적인 화면 대시보드 UI 구성
+        # 4. 화면 대시보드 UI 구성
         # ---------------------------------------------------------
         st.title("📦 3PL WMS 수주 업로드 변환 센터")
 
-        # [요약 지표 카드로 상단에 한눈에 표출]
         total_cnt = len(df_result)
         normal_cnt = len(df_result[df_result['매핑상태'] == '정상'])
         check_cnt = total_cnt - normal_cnt
@@ -223,7 +218,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         col2.metric("✅ 자동 정상 매핑", f"{normal_cnt} 건")
         col3.metric("⚠️ 검토 필요 건수", f"{check_cnt} 건", delta_color="inverse")
 
-        # 엑셀 다운로드 버튼 (상단배치로 편의성 향상)
+        # 엑셀 다운로드 파일 버퍼 생성
         wms_pure_cols = ['출고구분', '수주일자', '납품일자', '발주처코드', '발주처', '배송코드', '배송지', '상품코드', '상품명', '수량', '단가', '합계', '부가세', 'LOT', '유효일자']
         df_wms_pure = df_result[wms_pure_cols].copy()
 
@@ -242,24 +237,33 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
         st.markdown("---")
 
-        # [탭(Tab) 구성을 통한 화면 분류 및 스크롤 최소화]
-        tab1, tab2, tab3 = st.tabs(["📋 3PL WMS 복사용 양식", "⚠️ 검토 필요 항목 (우선 확인)", "🔍 전체 데이터 확인"])
+        # ---------------------------------------------------------
+        # 5. 탭 구성 (첫번째 탭: 전체 데이터 확인, 두번째 탭: WMS 복사용 양식)
+        # ---------------------------------------------------------
+        tab1, tab2 = st.tabs(["🔍 전체 데이터 확인", "📋 3PL WMS 복사용 양식"])
 
+        # 📌 [탭 1] 전체 데이터 확인 (요청하신 4개 컬럼 생략: 출고구분, 수주일자, 발주처코드, 발주처)
         with tab1:
-            st.caption("📌 **3PL WMS 시스템에 그대로 드래그&복사(`Ctrl+C`)할 수 있는 순서입니다.**")
-            st.dataframe(df_wms_pure, height=450, use_container_width=True)
+            st.caption("📌 핵심 결과 내역입니다. (검토필요 항목은 빨간색으로 강조 표시됩니다)")
+            
+            show_cols = ['납품일자', '배송코드', '배송지', '상품코드', '상품명', '수량', '단가', '합계', '부가세', 'LOT', '유효일자', '매핑상태']
+            df_show = df_result[show_cols].copy()
 
+            # 매핑상태에 따른 행 스타일 함수 (검토필요 시 빨간색 강조)
+            def highlight_status(row):
+                if '검토필요' in str(row['매핑상태']):
+                    return ['background-color: #f8d7da; color: #dc3545; font-weight: bold;'] * len(row)
+                return [''] * len(row)
+
+            styled_show = df_show.style.apply(highlight_status, axis=1)
+            
+            # hide_index=True 로 행번호(0,1,2...) 제거
+            st.dataframe(styled_show, height=500, use_container_width=True, hide_index=True)
+
+        # 📌 [탭 2] 3PL WMS 복사용 양식
         with tab2:
-            df_check = df_result[df_result['매핑상태'] != '정상']
-            if not df_check.empty:
-                st.warning(f"총 {len(df_check)}건의 항목에 재고 부족 또는 마스터 확인이 필요합니다.")
-                st.dataframe(df_check[['배송지', '상품코드', '상품명', '수량', '매핑상태', 'LOT', '유효일자']], height=400, use_container_width=True)
-            else:
-                st.success("🎉 검토가 필요한 항목이 없습니다! 모든 항목이 정상 매핑되었습니다.")
-
-        with tab3:
-            st.caption("📌 전체 매핑 결과 및 상태")
-            st.dataframe(df_result, height=450, use_container_width=True)
+            st.caption("📌 **3PL WMS 시스템 입력용 표준 양식입니다. `hide_index` 적용으로 드래그/복사(`Ctrl+C`) 시 순수 데이터만 깔끔하게 복사됩니다.**")
+            st.dataframe(df_wms_pure, height=500, use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"처리 중 오류가 발생했습니다: {e}")
