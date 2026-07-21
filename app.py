@@ -91,33 +91,33 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         # 헤더 위치 자동 찾기 (row 0 또는 row 1)
         header_row_idx = 1 if len(df_wms_raw) > 1 and '상품코드' in df_wms_raw.iloc[1].values else 0
         df_wms = df_wms_raw.iloc[header_row_idx + 1:].copy()
-        df_wms.columns = df_wms_raw.iloc[header_row_idx].values
+        
+        headers = [str(val).strip() for val in df_wms_raw.iloc[header_row_idx].values]
 
-        # 컬럼 위치 자동 검색
-        def get_col_val(df, col_name_keywords):
-            for col in df.columns:
-                col_str = str(col).strip()
-                for kw in col_name_keywords:
-                    if kw in col_str:
-                        return col
+        # 중복 컬럼 대응: 컬럼 이름이 아닌 위치(인덱스 번호)로 탐색
+        def get_col_idx(headers_list, keywords):
+            for kw in keywords:
+                for idx, h in enumerate(headers_list):
+                    if kw in h:
+                        return idx
             return None
 
-        col_mecode = get_col_val(df_wms, ['상품코드', '상품'])
-        col_name = get_col_val(df_wms, ['상품명'])
-        col_lot = get_col_val(df_wms, ['화주LOT', 'LOT'])
-        col_exp = get_col_val(df_wms, ['유효일자', '유통기한'])
-        col_box = get_col_val(df_wms, ['입수량(BOX)', 'BOX입수'])
-        col_tot_qty = get_col_val(df_wms, ['합계수량', '정상수량'])
-        col_barcode = get_col_val(df_wms, ['상품바코드', '바코드'])
+        idx_mecode = get_col_idx(headers, ['상품코드', '상품'])
+        idx_name = get_col_idx(headers, ['상품명'])
+        idx_lot = get_col_idx(headers, ['화주LOT', 'LOT'])
+        idx_exp = get_col_idx(headers, ['유효일자', '유통기한'])
+        idx_box = get_col_idx(headers, ['입수량(BOX)', 'BOX입수'])
+        idx_tot_qty = get_col_idx(headers, ['합계수량', '정상수량'])
+        idx_barcode = get_col_idx(headers, ['상품바코드', '바코드'])
 
         wms_stock_data = pd.DataFrame({
-            'ME코드': df_wms[col_mecode].astype(str).str.strip() if col_mecode is not None else '',
-            '상품명': df_wms[col_name].astype(str).str.strip() if col_name is not None else '',
-            '화주LOT': df_wms[col_lot].astype(str).str.strip() if col_lot is not None else '',
-            '유효일자': pd.to_datetime(df_wms[col_exp], errors='coerce') if col_exp is not None else pd.NaT,
-            '입수량_BOX': pd.to_numeric(df_wms[col_box], errors='coerce').fillna(1) if col_box is not None else 1,
-            '합계수량': pd.to_numeric(df_wms[col_tot_qty], errors='coerce').fillna(0) if col_tot_qty is not None else 0,
-            '상품바코드': df_wms[col_barcode].astype(str).str.replace('.0', '', regex=False).str.strip() if col_barcode is not None else ''
+            'ME코드': df_wms.iloc[:, idx_mecode].astype(str).str.strip() if idx_mecode is not None else '',
+            '상품명': df_wms.iloc[:, idx_name].astype(str).str.strip() if idx_name is not None else '',
+            '화주LOT': df_wms.iloc[:, idx_lot].astype(str).str.strip() if idx_lot is not None else '',
+            '유효일자': pd.to_datetime(df_wms.iloc[:, idx_exp], errors='coerce') if idx_exp is not None else pd.NaT,
+            '입수량_BOX': pd.to_numeric(df_wms.iloc[:, idx_box], errors='coerce').fillna(1) if idx_box is not None else 1,
+            '합계수량': pd.to_numeric(df_wms.iloc[:, idx_tot_qty], errors='coerce').fillna(0) if idx_tot_qty is not None else 0,
+            '상품바코드': df_wms.iloc[:, idx_barcode].astype(str).str.replace('.0', '', regex=False).str.strip() if idx_barcode is not None else ''
         })
 
         wms_upload_list = []
@@ -177,7 +177,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
             if not mecode:
                 status = "마스터미등록"
             else:
-                # 📌 [개선] 3단계 계층적 매핑으로 오매칭 완벽 방지
+                # 3단계 계층적 매핑
                 sub_stock = wms_stock_data[wms_stock_data['ME코드'] == mecode].copy()
                 
                 if sub_stock.empty and item_barcode:
