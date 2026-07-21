@@ -1,190 +1,127 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import io
+import os
+
+st.set_page_config(page_title="올리브영 수주 자동화 시스템", layout="wide")
+st.title("📦 올리브영 수주업로드 및 재고 매핑 시스템")
 
 # ---------------------------------------------------------
-# Page Configuration
+# 1. 깃허브 저장소에 올라가 있는 고정 서식 파일 이름
 # ---------------------------------------------------------
-st.set_page_config(page_title="올리브영 수주 매핑 자동화", layout="wide")
+MASTER_FILE_NAME = "oliveyoung_master.xlsx"
 
-st.title("📦 올리브영 발주 - 3PL WMS 일일재고 자동 매핑 솔루션")
-st.caption("검토필요 항목도 ME코드 및 기본 정보를 정상 매핑하여 출력합니다.")
+@st.cache_data(ttl=60) # 깃허브에서 파일이 변경되면 60초 후 자동으로 새 데이터를 반영합니다.
+def load_master_data(file_path):
+    """깃허브에 등록된 마스터 서식파일에서 제품명 및 배송처 정보를 읽어옵니다."""
+    # 1) [제품명] 시트 로드
+    df_product = pd.read_excel(file_path, sheet_name='제품명')
+    
+    # '상품코드' 열이 있는 행만 가져오기
+    df_product_clean = df_product.dropna(subset=['상품코드']).copy()
+    
+    # 상품명과 상품코드(MEcode) 앞뒤 공백 제거 후 딕셔너리로 변환
+    mecode_map = dict(zip(
+        df_product_clean['상품명'].astype(str).str.strip(), 
+        df_product_clean['상품코드'].astype(str).str.strip()
+    ))
+    
+    # 2) [배송처] 시트 로드
+    df_delivery = pd.read_excel(file_path, sheet_name='배송처')
+    
+    return mecode_map, df_delivery
 
-# 센터명 -> 배송코드 매핑 사전
-CENTER_MAP = {
-    '[L002] 부곡센터': '86100086',
-    '[L003] 중부센터': '86100118',
-    '[LA04] 양지온라인센터': '86101125',
-    '[LA02] 양지센터': '86101126',
-    '[LA0A] 경산센터': '81032980'
-}
+# ---------------------------------------------------------
+# 2. 마스터 파일 연동 확인 및 일일 작업 파일 업로드
+# ---------------------------------------------------------
+st.sidebar.header("📁 작업 파일 업로드")
+
+# 깃허브 서버에 파일이 잘 올라가 있는지 확인
+if os.path.exists(MASTER_FILE_NAME):
+    st.sidebar.success(f"✅ 마스터 서식 연동 완료 (`{MASTER_FILE_NAME}`)")
+    mecode_map, df_delivery_master = load_master_data(MASTER_FILE_NAME)
+else:
+    st.sidebar.error(f"❌ 깃허브에서 `{MASTER_FILE_NAME}` 파일을 찾을 수 없습니다.")
+    st.sidebar.info("깃허브 저장소에 `oliveyoung_master.xlsx` 파일을 업로드해 주세요.")
+
+# 작업 시 매번 올려줄 파일 2개
+order_file = st.sidebar.file_uploader("1. 올리브영 발주서 (Raw DATA)", type=["xlsx"])
+wms_file = st.sidebar.file_uploader("2. WMS 일일재고 파일", type=["xlsx"])
 
 # ---------------------------------------------------------
-# Sidebar File Upload
+# 3. 데이터 매핑 로직 실행
 # ---------------------------------------------------------
-st.sidebar.header("📁 엑셀 파일 업로드")
-stock_file = st.sidebar.file_uploader("1. WMS 일일재고 파일 (.xlsx)", type=["xlsx"])
-order_file = st.sidebar.file_uploader("2. 올리브영 납품확인서 목록 (.xlsx)", type=["xlsx"])
-
-# ---------------------------------------------------------
-# Main Logic
-# ---------------------------------------------------------
-if stock_file and order_file:
+if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
     try:
-        # =========================================================
-        # 1. 일일재고 파일 읽기
-        # =========================================================
-        df_stock_raw = pd.read_excel(stock_file, header=None)
-        df_stock = df_stock_raw.iloc[2:].copy()
+        # 발주서 및 WMS 재고 로드
+        df_order = pd.read_excel(order_file)
+        df_wms = pd.read_excel(wms_file)
         
-        stock_data = pd.DataFrame({
-            'ME코드': df_stock[3].astype(str).str.strip(),
-            '화주LOT': df_stock[6].astype(str).str.strip(),
-            '유효일자': pd.to_datetime(df_stock[13], errors='coerce'),
-            '입수량_BOX': pd.to_numeric(df_stock[17], errors='coerce').fillna(1),
-            '합계수량': pd.to_numeric(df_stock[31], errors='coerce').fillna(0),
-            '상품바코드': df_stock[33].astype(str).str.replace('.0', '', regex=False).str.strip()
-        })
-        
-        # =========================================================
-        # 2. 올리브영 납품확인서 목록 파일 읽기
-        # =========================================================
-        df_order_raw = pd.read_excel(order_file, header=None)
-        
-        order_header_idx = 0
-        for i, row in df_order_raw.iterrows():
-            if '상품코드' in row.values:
-                order_header_idx = i
-                break
-                
-        df_order = pd.read_excel(order_file, header=order_header_idx)
-        df_order.columns = [str(c).strip() for c in df_order.columns]
-        
-        # 상품명이 없거나 빈 행은 제외
-        df_order = df_order[df_order['상품명'].notna() & (df_order['상품명'].astype(str).str.strip() != '')].copy()
-        
-        df_order['상품코드_str'] = df_order['상품코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
-        df_order['입고예정일'] = pd.to_datetime(df_order['입고예정일'], errors='coerce')
-        df_order['발주수량\n(EA)'] = pd.to_numeric(df_order['발주수량\n(EA)'], errors='coerce').fillna(0).astype(int)
-        df_order['원단가'] = pd.to_numeric(df_order.get('원단가', 0), errors='coerce').fillna(0).astype(int)
-        
-        # 원가금액이 없거나 0인 경우 단가 * 수량으로 계산
-        df_order['원가금액'] = pd.to_numeric(df_order.get('원가금액', 0), errors='coerce').fillna(0).astype(int)
-        df_order['원가금액'] = np.where(df_order['원가금액'] == 0, df_order['원단가'] * df_order['발주수량\n(EA)'], df_order['원가금액'])
-        
-        # =========================================================
-        # 3. 매핑 및 출고 제약조건 처리
-        # =========================================================
+        # WMS 헤더 정리
+        if '상품명' not in df_wms.columns:
+            df_wms.columns = df_wms.iloc[0]
+            df_wms = df_wms[1:].reset_index(drop=True)
+
         results = []
-        today = datetime.now()
-        
+        missing_products = [] # [제품명] 시트에 없는 신규 상품 저장 목록
+
         for idx, row in df_order.iterrows():
-            barcode = row['상품코드_str']
-            order_qty = int(row['발주수량\n(EA)'])
-            order_date = row['입고예정일'] if pd.notnull(row['입고예정일']) else today
-            center_name = str(row.get('센터', '')).strip()
-            unit_price = int(row.get('원단가', 0))
-            total_amount = int(row.get('원가금액', 0))
+            item_name = str(row.get('상품명', '')).strip()
+            order_qty = row.get('발주수량\n(EA)', row.get('발주수량', 0))
             
-            # 1) 바코드 또는 ME코드로 전체 재고 탐색 (필터링 전 원본)
-            sub_stock_all = stock_data[
-                (stock_data['상품바코드'] == barcode) | 
-                (stock_data['ME코드'] == barcode)
-            ].copy()
+            # [A] 깃허브 마스터 서식 [제품명] 시트에서 MEcode 끌어오기
+            mecode = mecode_map.get(item_name, None)
             
-            # 🛑 [핵심 수정] 재고 유무와 상관없이 원본 데이터에서 ME코드 우선 추출
-            me_code = ""
-            if not sub_stock_all.empty:
-                me_code = sub_stock_all.iloc[0]['ME코드']
-            
-            # 2) 출고 가능 조건 필터링
-            # 1년 6개월(547일) 이상 남은 재고
-            min_valid_date = order_date + timedelta(days=547)
-            valid_stock = sub_stock_all[sub_stock_all['유효일자'] >= min_valid_date].copy()
-            
-            # 박스 입수량 미만 재고 제외
-            valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량_BOX']]
-            
-            # FEFO 정렬
-            valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
-            
-            selected_lot = ""
-            selected_exp_date = ""
-            status_msg = "정상"
-            
-            if not valid_stock.empty:
-                fefo_match = valid_stock[valid_stock['합계수량'] >= order_qty]
-                
-                if not fefo_match.empty:
-                    best_lot = fefo_match.iloc[0]
-                    selected_lot = best_lot['화주LOT']
-                    if pd.notnull(best_lot['유효일자']):
-                        selected_exp_date = best_lot['유효일자'].strftime('%Y%m%d')
-                else:
-                    total_avail_qty = valid_stock['합계수량'].sum()
-                    if total_avail_qty >= order_qty:
-                        status_msg = "검토필요 (LOT 분할 필요)"
-                    else:
-                        status_msg = "검토필요 (유효재고 부족)"
+            if not mecode:
+                # [제품명] 시트에 상품이 없는 경우
+                missing_products.append(item_name)
+                status = "검토필요 (신규상품 - [제품명] 시트 미등록)"
+                lot, expiry = "", ""
             else:
-                status_msg = "검토필요 (출고가능 재고없음)"
+                # [B] WMS 재고 조회 및 유효일자(FEFO) 기준 매핑
+                wms_match = df_wms[
+                    (df_wms['상품명'].astype(str).str.strip() == item_name) | 
+                    (df_wms['상품코드'].astype(str).str.strip() == mecode)
+                ]
                 
-            shipping_code = CENTER_MAP.get(center_name, '')
+                # 유효일자 임박순 정렬
+                wms_match = wms_match.sort_values(by='유효일자', ascending=True)
+                
+                total_stock = pd.to_numeric(wms_match['정상수량'], errors='coerce').sum() if '정상수량' in wms_match.columns else 0
+                
+                if total_stock >= order_qty and len(wms_match) > 0:
+                    status = "정상"
+                    lot = wms_match.iloc[0]['화주LOT']
+                    expiry = str(wms_match.iloc[0]['유효일자'])[:10].replace('-', '')
+                else:
+                    status = "검토필요 (출고가능 재고없음)"
+                    lot = ""
+                    expiry = ""
             
-            out_row = {
-                '입고예정일': order_date.strftime('%Y%m%d') if pd.notnull(order_date) else '',
+            results.append({
+                '입고예정일': str(row.get('입고예정일', ''))[:10].replace('-', ''),
                 '발주처코드': '86100000',
-                '배송코드': shipping_code,
-                'MEcode': me_code,
-                '상품명': row.get('상품명', ''),
+                'MEcode': mecode if mecode else "미등록",
+                '상품명': item_name,
                 '수량': order_qty,
-                '단가': unit_price,
-                '발주원가': unit_price,
-                '발주금액': total_amount,
-                'LOT': selected_lot,
-                '유효일자': selected_exp_date,
-                '매핑상태': status_msg
-            }
-            results.append(out_row)
-            
+                '단가': row.get('원단가', 0),
+                '발주금액': row.get('원가금액', 0),
+                'LOT': lot,
+                '유효일자': expiry,
+                '매핑상태': status
+            })
+
         df_result = pd.DataFrame(results)
-        
-        # =========================================================
-        # 4. 결과 출력
-        # =========================================================
-        normal_cnt = (df_result['매핑상태'] == '정상').sum()
-        review_cnt = len(df_result) - normal_cnt
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("📊 전체 수주 건수", f"{len(df_result)} 건")
-        col2.metric("🟢 정상 매핑 건수", f"{normal_cnt} 건")
-        col3.metric("🔴 검토 필요 건수", f"{review_cnt} 건")
-        
-        st.subheader("📋 수주 매핑 최종 결과 목록")
-        
-        def highlight_review(row):
-            if '검토필요' in str(row['매핑상태']):
-                return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
-            return [''] * len(row)
-            
-        styled_df = df_result.style.apply(highlight_review, axis=1)
-        st.dataframe(styled_df, use_container_width=True)
-        
-        # 엑셀 다운로드
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_result.to_excel(writer, index=False, sheet_name='서식(수주업로드)')
-            
-        st.download_button(
-            label="📥 결과 엑셀 파일 다운로드",
-            data=output.getvalue(),
-            file_name=f"올리브영_수주업로드_완료_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+
+        # 4) 신규 상품 경고 및 매핑 결과 출력
+        if missing_products:
+            st.error(f"⚠️ [제품명] 시트에 없는 신규 상품이 {len(set(missing_products))}건 발견되었습니다!")
+            st.warning("깃허브(GitHub)에 올려둔 `oliveyoung_master.xlsx` 파일의 [제품명] 시트에 아래 상품을 추가하고 새로 덮어씌워 업로드해주세요.")
+            st.dataframe(pd.DataFrame({'미등록 신규 상품명': list(set(missing_products))}))
+
+        st.subheader("📋 수주 업로드 최종 결과")
+        st.dataframe(df_result, use_container_width=True)
 
     except Exception as e:
-        st.error(f"처리 중 오류가 발생했습니다: {e}")
+        st.error(f"오류가 발생했습니다: {e}")
 else:
-    st.info("👈 좌측 사이드바에 '일일재고' 및 '납품확인서 목록' 엑셀 파일을 업로드해주세요.")
+    st.info("왼쪽 사이드바에서 발주서와 WMS 일일재고 엑셀 파일 2개를 올려주세요.")
