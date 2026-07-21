@@ -149,10 +149,11 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
             selected_lot = ""
             selected_exp = ""
+            box_pack = 1  # 기본 입수량
             status = "정상"
 
             if not mecode:
-                status = "검토필요 (마스터 미등록)"
+                status = "마스터미등록"
             else:
                 sub_stock = wms_stock_data[
                     (wms_stock_data['ME코드'] == mecode) | 
@@ -160,15 +161,24 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                     (wms_stock_data['상품명'] == item_name)
                 ].copy()
 
+                if not sub_stock.empty:
+                    box_pack = int(sub_stock.iloc[0]['입수량_BOX'])
+
                 # 조건 1: 유효일자 1년 6개월(547일) 이상 남은 재고
                 min_valid_date = arr_dt + timedelta(days=547)
                 valid_stock = sub_stock[sub_stock['유효일자'] >= min_valid_date].copy()
 
-                # 조건 2: 박스 입수량 이상 재고
+                # 조건 2: 박스 입수량 이상 재고 (입수부족 체크)
                 valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량_BOX']]
                 valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
 
-                if not valid_stock.empty:
+                if not sub_stock.empty and valid_stock.empty:
+                    # 전체 재고는 있으나 유효일자 1.5년 미달 또는 입수량 부족인 경우
+                    status = "유효일자 미달"
+                elif valid_stock.empty:
+                    status = "재고부족"
+                else:
+                    # 조건 3: 단일 LOT 충족 여부
                     single_lot_match = valid_stock[valid_stock['합계수량'] >= order_qty]
                     if not single_lot_match.empty:
                         best_match = single_lot_match.iloc[0]
@@ -177,11 +187,9 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                             selected_exp = best_match['유효일자'].strftime('%Y-%m-%d')
                     else:
                         if valid_stock['합계수량'].sum() >= order_qty:
-                            status = "검토필요 (LOT 분할 필요)"
+                            status = "LOT분할필요"
                         else:
-                            status = "검토필요 (유효재고 부족)"
-                else:
-                    status = "검토필요 (출고가능 재고없음)"
+                            status = "재고부족"
 
             wms_upload_list.append({
                 '출고구분': 0,
@@ -193,6 +201,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 '배송지': center_name,
                 '상품코드': mecode if mecode else "미등록",
                 '상품명': item_name,
+                '입수량': box_pack,
                 '수량': order_qty,
                 '단가': unit_price,
                 '합계': total_amount,
@@ -218,7 +227,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         col2.metric("✅ 자동 정상 매핑", f"{normal_cnt} 건")
         col3.metric("⚠️ 검토 필요 건수", f"{check_cnt} 건", delta_color="inverse")
 
-        # 엑셀 다운로드 파일 버퍼 생성
+        # 3PL WMS 다운로드 버퍼 생성
         wms_pure_cols = ['출고구분', '수주일자', '납품일자', '발주처코드', '발주처', '배송코드', '배송지', '상품코드', '상품명', '수량', '단가', '합계', '부가세', 'LOT', '유효일자']
         df_wms_pure = df_result[wms_pure_cols].copy()
 
@@ -238,31 +247,29 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         st.markdown("---")
 
         # ---------------------------------------------------------
-        # 5. 탭 구성 (첫번째 탭: 전체 데이터 확인, 두번째 탭: WMS 복사용 양식)
+        # 5. 탭 구성
         # ---------------------------------------------------------
         tab1, tab2 = st.tabs(["🔍 전체 데이터 확인", "📋 3PL WMS 복사용 양식"])
 
-        # 📌 [탭 1] 전체 데이터 확인 (요청하신 4개 컬럼 생략: 출고구분, 수주일자, 발주처코드, 발주처)
+        # 📌 [탭 1] 전체 데이터 확인 (단가/합계/부가세 삭제, 입수량 추가)
         with tab1:
-            st.caption("📌 핵심 결과 내역입니다. (검토필요 항목은 빨간색으로 강조 표시됩니다)")
+            st.caption("📌 핵심 처리 내역입니다. (검토필요/오류 항목은 빨간색으로 강조 표시됩니다)")
             
-            show_cols = ['납품일자', '배송코드', '배송지', '상품코드', '상품명', '수량', '단가', '합계', '부가세', 'LOT', '유효일자', '매핑상태']
+            show_cols = ['납품일자', '배송코드', '배송지', '상품코드', '상품명', '입수량', '수량', 'LOT', '유효일자', '매핑상태']
             df_show = df_result[show_cols].copy()
 
-            # 매핑상태에 따른 행 스타일 함수 (검토필요 시 빨간색 강조)
+            # 매핑상태에 따른 빨간색 하이라이트 함수
             def highlight_status(row):
-                if '검토필요' in str(row['매핑상태']):
+                if str(row['매핑상태']) != '정상':
                     return ['background-color: #f8d7da; color: #dc3545; font-weight: bold;'] * len(row)
                 return [''] * len(row)
 
             styled_show = df_show.style.apply(highlight_status, axis=1)
-            
-            # hide_index=True 로 행번호(0,1,2...) 제거
             st.dataframe(styled_show, height=500, use_container_width=True, hide_index=True)
 
         # 📌 [탭 2] 3PL WMS 복사용 양식
         with tab2:
-            st.caption("📌 **3PL WMS 시스템 입력용 표준 양식입니다. `hide_index` 적용으로 드래그/복사(`Ctrl+C`) 시 순수 데이터만 깔끔하게 복사됩니다.**")
+            st.caption("📌 **3PL WMS 시스템 입력용 표준 양식입니다. 복사(`Ctrl+C`) 시 순수 데이터만 깔끔하게 복사됩니다.**")
             st.dataframe(df_wms_pure, height=500, use_container_width=True, hide_index=True)
 
     except Exception as e:
