@@ -21,10 +21,9 @@ def clean_barcode(val):
 
 @st.cache_data(ttl=60)
 def load_master_data(file_path):
-    """마스터 파일의 [제품명] 시트에서 (상품바코드 ➔ MEcode) 및 (상품명 ➔ MEcode) 맵을 생성합니다."""
+    """마스터 파일에서 [제품명] 시트(바코드, MEcode) 및 [배송처] 시트(배송처, 배송코드) 정보를 읽어옵니다."""
+    # 1) [제품명] 시트 매핑
     df_product = pd.read_excel(file_path, sheet_name='제품명')
-    
-    # 컬럼명 자동 파악 ('상품바코드', '상품코드'(MEcode), '상품명')
     barcode_col = '상품바코드' if '상품바코드' in df_product.columns else df_product.columns[0]
     mecode_col = '상품코드' if '상품코드' in df_product.columns else df_product.columns[2]
     name_col = '상품명' if '상품명' in df_product.columns else df_product.columns[1]
@@ -43,7 +42,21 @@ def load_master_data(file_path):
             if p_name:
                 name_to_mecode[p_name] = m_code
 
-    return barcode_to_mecode, name_to_mecode
+    # 2) [배송처] 시트 매핑 (센터명 ➔ 배송코드)
+    df_delivery = pd.read_excel(file_path, sheet_name='배송처')
+    delivery_map = {}
+    
+    deliv_name_col = '배송처' if '배송처' in df_delivery.columns else df_delivery.columns[0]
+    deliv_code_col = '배송코드' if '배송코드' in df_delivery.columns else df_delivery.columns[1]
+
+    for _, row in df_delivery.dropna(subset=[deliv_name_col, deliv_code_col]).iterrows():
+        d_name = str(row[deliv_name_col]).strip()
+        d_code = str(row[deliv_code_col]).strip()
+        if d_code.endswith('.0'):
+            d_code = d_code[:-2]
+        delivery_map[d_name] = d_code
+
+    return barcode_to_mecode, name_to_mecode, delivery_map
 
 # ---------------------------------------------------------
 # 2. 사이드바 및 파일 업로드
@@ -53,7 +66,7 @@ st.sidebar.header("📁 일일 작업 파일 업로드")
 if os.path.exists(MASTER_FILE_NAME):
     st.sidebar.success(f"✅ 마스터 서식 연동 완료 (`{MASTER_FILE_NAME}`)")
     try:
-        barcode_to_mecode, name_to_mecode = load_master_data(MASTER_FILE_NAME)
+        barcode_to_mecode, name_to_mecode, delivery_map = load_master_data(MASTER_FILE_NAME)
     except Exception as e:
         st.sidebar.error(f"마스터 파일 읽기 오류: {e}")
 else:
@@ -83,7 +96,11 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         for idx, row in df_order.iterrows():
             item_name = str(row.get('상품명', '')).strip()
             item_barcode = clean_barcode(row.get('상품코드', '')) # 납품확인서의 상품코드 = 13자리 바코드
+            center_name = str(row.get('센터', '')).strip()       # 납품확인서의 센터 (H열)
             
+            # 🚚 배송코드 매칭 ([배송처] 시트 참조)
+            delivery_code = delivery_map.get(center_name, "미등록배송처")
+
             # 발주수량 (EA)
             order_qty = row.get('발주수량\n(EA)', row.get('발주수량', row.get('수량', 0)))
             try:
@@ -135,6 +152,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
             results.append({
                 '입고예정일': arr_date,
                 '발주처코드': '86100000',
+                '배송코드': delivery_code,
                 'MEcode': mecode if mecode else "미등록",
                 '상품명': item_name,
                 '수량': order_qty,
