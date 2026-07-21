@@ -84,17 +84,40 @@ wms_file = st.sidebar.file_uploader("2. WMS 일일재고 파일", type=["xlsx"])
 if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
     try:
         df_order = pd.read_excel(order_file)
-        df_wms_raw = pd.read_excel(wms_file, header=None)
-        df_wms = df_wms_raw.iloc[2:].copy() if len(df_wms_raw) > 2 else df_wms_raw.copy()
         
+        # WMS 일일재고 컬럼 정밀 파싱
+        df_wms_raw = pd.read_excel(wms_file, header=None)
+        
+        # 헤더 위치 자동 찾기 (row 0 또는 row 1)
+        header_row_idx = 1 if len(df_wms_raw) > 1 and '상품코드' in df_wms_raw.iloc[1].values else 0
+        df_wms = df_wms_raw.iloc[header_row_idx + 1:].copy()
+        df_wms.columns = df_wms_raw.iloc[header_row_idx].values
+
+        # 컬럼 위치 자동 검색
+        def get_col_val(df, col_name_keywords):
+            for col in df.columns:
+                col_str = str(col).strip()
+                for kw in col_name_keywords:
+                    if kw in col_str:
+                        return col
+            return None
+
+        col_mecode = get_col_val(df_wms, ['상품코드', '상품'])
+        col_name = get_col_val(df_wms, ['상품명'])
+        col_lot = get_col_val(df_wms, ['화주LOT', 'LOT'])
+        col_exp = get_col_val(df_wms, ['유효일자', '유통기한'])
+        col_box = get_col_val(df_wms, ['입수량(BOX)', 'BOX입수'])
+        col_tot_qty = get_col_val(df_wms, ['합계수량', '정상수량'])
+        col_barcode = get_col_val(df_wms, ['상품바코드', '바코드'])
+
         wms_stock_data = pd.DataFrame({
-            'ME코드': df_wms[3].astype(str).str.strip() if 3 in df_wms.columns else '',
-            '상품명': df_wms[4].astype(str).str.strip() if 4 in df_wms.columns else '',
-            '화주LOT': df_wms[6].astype(str).str.strip() if 6 in df_wms.columns else '',
-            '유효일자': pd.to_datetime(df_wms[13], errors='coerce') if 13 in df_wms.columns else pd.NaT,
-            '입수량_BOX': pd.to_numeric(df_wms[17], errors='coerce').fillna(1) if 17 in df_wms.columns else 1,
-            '합계수량': pd.to_numeric(df_wms[31], errors='coerce').fillna(0) if 31 in df_wms.columns else 0,
-            '상품바코드': df_wms[33].astype(str).str.replace('.0', '', regex=False).str.strip() if 33 in df_wms.columns else ''
+            'ME코드': df_wms[col_mecode].astype(str).str.strip() if col_mecode is not None else '',
+            '상품명': df_wms[col_name].astype(str).str.strip() if col_name is not None else '',
+            '화주LOT': df_wms[col_lot].astype(str).str.strip() if col_lot is not None else '',
+            '유효일자': pd.to_datetime(df_wms[col_exp], errors='coerce') if col_exp is not None else pd.NaT,
+            '입수량_BOX': pd.to_numeric(df_wms[col_box], errors='coerce').fillna(1) if col_box is not None else 1,
+            '합계수량': pd.to_numeric(df_wms[col_tot_qty], errors='coerce').fillna(0) if col_tot_qty is not None else 0,
+            '상품바코드': df_wms[col_barcode].astype(str).str.replace('.0', '', regex=False).str.strip() if col_barcode is not None else ''
         })
 
         wms_upload_list = []
@@ -109,7 +132,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
             center_name = str(row.get('센터', '')).strip()
             delivery_code = delivery_map.get(center_name, "미등록배송처")
 
-            # 수주일자 / 납품일자 (입고예정일)
+            # 수주일자 / 납품일자
             raw_order_date = row.get('발주일자', today)
             try:
                 order_date_str = pd.to_datetime(raw_order_date).strftime('%Y-%m-%d')
@@ -124,7 +147,6 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 arr_dt = today
                 arr_date_str = today.strftime('%Y-%m-%d')
 
-            # 수량/단가/합계/부가세(10%)
             try:
                 order_qty = int(float(row.get('발주수량\n(EA)', row.get('발주수량', 0))))
             except:
@@ -142,38 +164,40 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
             vat_amount = int(total_amount * 0.1)
 
-            # 상품코드(MEcode) 매핑
+            # MEcode 매핑
             mecode = barcode_to_mecode.get(item_barcode, None)
             if not mecode:
                 mecode = name_to_mecode.get(item_name, None)
 
             selected_lot = ""
             selected_exp = ""
-            box_pack = 1  # 기본 입수량
+            box_pack = 1
             status = "정상"
 
             if not mecode:
                 status = "마스터미등록"
             else:
-                sub_stock = wms_stock_data[
-                    (wms_stock_data['ME코드'] == mecode) | 
-                    (wms_stock_data['상품바코드'] == item_barcode) |
-                    (wms_stock_data['상품명'] == item_name)
-                ].copy()
+                # 📌 [개선] 3단계 계층적 매핑으로 오매칭 완벽 방지
+                sub_stock = wms_stock_data[wms_stock_data['ME코드'] == mecode].copy()
+                
+                if sub_stock.empty and item_barcode:
+                    sub_stock = wms_stock_data[wms_stock_data['상품바코드'] == item_barcode].copy()
+                
+                if sub_stock.empty and item_name:
+                    sub_stock = wms_stock_data[wms_stock_data['상품명'] == item_name].copy()
 
                 if not sub_stock.empty:
                     box_pack = int(sub_stock.iloc[0]['입수량_BOX'])
 
-                # 조건 1: 유효일자 1년 6개월(547일) 이상 남은 재고
+                # 조건 1: 유효일자 1.5년(547일) 이상 남은 재고
                 min_valid_date = arr_dt + timedelta(days=547)
                 valid_stock = sub_stock[sub_stock['유효일자'] >= min_valid_date].copy()
 
-                # 조건 2: 박스 입수량 이상 재고 (입수부족 체크)
+                # 조건 2: 박스 입수량 이상 재고
                 valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량_BOX']]
                 valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
 
                 if not sub_stock.empty and valid_stock.empty:
-                    # 전체 재고는 있으나 유효일자 1.5년 미달 또는 입수량 부족인 경우
                     status = "유효일자 미달"
                 elif valid_stock.empty:
                     status = "재고부족"
@@ -227,7 +251,6 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         col2.metric("✅ 자동 정상 매핑", f"{normal_cnt} 건")
         col3.metric("⚠️ 검토 필요 건수", f"{check_cnt} 건", delta_color="inverse")
 
-        # 3PL WMS 다운로드 버퍼 생성
         wms_pure_cols = ['출고구분', '수주일자', '납품일자', '발주처코드', '발주처', '배송코드', '배송지', '상품코드', '상품명', '수량', '단가', '합계', '부가세', 'LOT', '유효일자']
         df_wms_pure = df_result[wms_pure_cols].copy()
 
@@ -251,14 +274,12 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
         # ---------------------------------------------------------
         tab1, tab2 = st.tabs(["🔍 전체 데이터 확인", "📋 3PL WMS 복사용 양식"])
 
-        # 📌 [탭 1] 전체 데이터 확인 (단가/합계/부가세 삭제, 입수량 추가)
         with tab1:
             st.caption("📌 핵심 처리 내역입니다. (검토필요/오류 항목은 빨간색으로 강조 표시됩니다)")
             
             show_cols = ['납품일자', '배송코드', '배송지', '상품코드', '상품명', '입수량', '수량', 'LOT', '유효일자', '매핑상태']
             df_show = df_result[show_cols].copy()
 
-            # 매핑상태에 따른 빨간색 하이라이트 함수
             def highlight_status(row):
                 if str(row['매핑상태']) != '정상':
                     return ['background-color: #f8d7da; color: #dc3545; font-weight: bold;'] * len(row)
@@ -267,7 +288,6 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
             styled_show = df_show.style.apply(highlight_status, axis=1)
             st.dataframe(styled_show, height=500, use_container_width=True, hide_index=True)
 
-        # 📌 [탭 2] 3PL WMS 복사용 양식
         with tab2:
             st.caption("📌 **3PL WMS 시스템 입력용 표준 양식입니다. 복사(`Ctrl+C`) 시 순수 데이터만 깔끔하게 복사됩니다.**")
             st.dataframe(df_wms_pure, height=500, use_container_width=True, hide_index=True)
