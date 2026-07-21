@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import io
 
 st.set_page_config(page_title="올리브영 수주 자동화 시스템", layout="wide")
 st.title("📦 올리브영 납품확인서 수주업로드 및 재고 매핑 시스템")
@@ -19,6 +20,13 @@ def clean_barcode(val):
         s = s[:-2]
     return s
 
+def is_valid_text(val):
+    """NaN, None, 빈 값 체크 함수"""
+    if pd.isna(val):
+        return False
+    s = str(val).strip().lower()
+    return s != "" and s != "nan" and s != "none"
+
 @st.cache_data(ttl=60)
 def load_master_data(file_path):
     """마스터 파일에서 [제품명] 시트(바코드, MEcode) 및 [배송처] 시트(배송처, 배송코드) 정보를 읽어옵니다."""
@@ -36,10 +44,10 @@ def load_master_data(file_path):
         m_code = str(row.get(mecode_col, '')).strip()
         p_name = str(row.get(name_col, '')).strip()
 
-        if m_code and m_code.lower() != 'nan':
+        if is_valid_text(m_code):
             if b_code:
                 barcode_to_mecode[b_code] = m_code
-            if p_name:
+            if is_valid_text(p_name):
                 name_to_mecode[p_name] = m_code
 
     # 2) [배송처] 시트 매핑 (센터명 ➔ 배송코드)
@@ -95,6 +103,11 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
         for idx, row in df_order.iterrows():
             item_name = str(row.get('상품명', '')).strip()
+            
+            # 🚫 상품명이 nan, None, 빈 값인 유효하지 않은 행은 결과 목록에서 제외
+            if not is_valid_text(item_name):
+                continue
+
             item_barcode = clean_barcode(row.get('상품코드', '')) # 납품확인서의 상품코드 = 13자리 바코드
             center_name = str(row.get('센터', '')).strip()       # 납품확인서의 센터 (H열)
             
@@ -137,7 +150,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
                 if total_stock >= order_qty and len(wms_match) > 0:
                     status = "정상"
                     lot_val = wms_match.iloc[0].get('화주LOT', '')
-                    lot = str(lot_val) if pd.notna(lot_val) and str(lot_val).lower() != 'nan' else ""
+                    lot = str(lot_val) if pd.notna(lot_val) and is_valid_text(lot_val) else ""
                     
                     exp_val = str(wms_match.iloc[0].get('유효일자', ''))
                     expiry = exp_val[:10].replace('-', '').replace('.', '')
@@ -165,6 +178,7 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
         df_result = pd.DataFrame(results)
 
+        # 미등록 신규 상품 경고 출력
         if unmapped_items:
             st.error(f"⚠️ [제품명] 시트에 미등록된 바코드/상품이 {len(unmapped_items)}건 발견되었습니다.")
             st.warning("`oliveyoung_master.xlsx` 의 [제품명] 시트에 바코드와 MEcode(상품코드)를 등록해 주세요.")
@@ -172,6 +186,21 @@ if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
 
         st.subheader("📋 수주 업로드 최종 결과")
         st.dataframe(df_result, use_container_width=True)
+
+        # ---------------------------------------------------------
+        # 4. 엑셀 다운로드 버튼 생성
+        # ---------------------------------------------------------
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Sheet1')
+        excel_data = excel_buffer.getvalue()
+
+        st.download_button(
+            label="📥 최종 수주업로드 결과 엑셀 다운로드",
+            data=excel_data,
+            file_name="올리브영_수주업로드_완료.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     except Exception as e:
         st.error(f"오류가 발생했습니다: {e}")
