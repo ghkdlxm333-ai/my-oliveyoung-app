@@ -1,335 +1,354 @@
-import streamlit as st
+from datetime import datetime
+from io import BytesIO
+import re
 import pandas as pd
-import numpy as np
-import os
-import io
-from datetime import datetime, timedelta
+import streamlit as st
 
-st.set_page_config(page_title="올리브영 WMS 수주 자동화", layout="wide")
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="올리브영 자동 출고 & LOT 매핑 (그레이스 3PL)",
+    page_icon="📦",
+    layout="wide",
+)
 
-# ---------------------------------------------------------
-# 1. 마스터 파일 연동 설정
-# ---------------------------------------------------------
-MASTER_FILE_NAME = "oliveyoung_master.xlsx"
+MIN_SHELF_LIFE_DAYS = 547  # 올리브영 납품 기준 잔여 유통기한 (1년 6개월 = 547일)
 
-def clean_barcode(val):
+# ============================================================
+# DATA CLEANING HELPERS
+# ============================================================
+def clean_str(val):
     if pd.isna(val):
         return ""
-    s = str(val).strip()
-    if s.endswith('.0'):
-        s = s[:-2]
-    return s
+    val_str = str(val).strip()
+    if val_str.endswith(".0"):
+        val_str = val_str[:-2]
+    return val_str
 
-def is_valid_text(val):
-    if pd.isna(val):
-        return False
-    s = str(val).strip().lower()
-    return s != "" and s != "nan" and s != "none"
-
-@st.cache_data(ttl=60)
-def load_master_data(file_path):
-    df_product = pd.read_excel(file_path, sheet_name='제품명')
-    barcode_col = '상품바코드' if '상품바코드' in df_product.columns else df_product.columns[0]
-    mecode_col = '상품코드' if '상품코드' in df_product.columns else df_product.columns[2]
-    name_col = '상품명' if '상품명' in df_product.columns else df_product.columns[1]
-
-    barcode_to_mecode = {}
-    name_to_mecode = {}
-
-    for _, row in df_product.iterrows():
-        b_code = clean_barcode(row.get(barcode_col, ''))
-        m_code = str(row.get(mecode_col, '')).strip()
-        p_name = str(row.get(name_col, '')).strip()
-
-        if is_valid_text(m_code):
-            if b_code:
-                barcode_to_mecode[b_code] = m_code
-            if is_valid_text(p_name):
-                name_to_mecode[p_name] = m_code
-
-    df_delivery = pd.read_excel(file_path, sheet_name='배송처')
-    deliv_name_col = '배송처' if '배송처' in df_delivery.columns else df_delivery.columns[0]
-    deliv_code_col = '배송코드' if '배송코드' in df_delivery.columns else df_delivery.columns[1]
-
-    delivery_map = {}
-    for _, row in df_delivery.dropna(subset=[deliv_name_col, deliv_code_col]).iterrows():
-        d_name = str(row[deliv_name_col]).strip()
-        d_code = str(row[deliv_code_col]).strip()
-        if d_code.endswith('.0'):
-            d_code = d_code[:-2]
-        delivery_map[d_name] = d_code
-
-    return barcode_to_mecode, name_to_mecode, delivery_map
-
-# ---------------------------------------------------------
-# 2. 사이드바 구성
-# ---------------------------------------------------------
-st.sidebar.title("📦 수주 자동화 메뉴")
-
-if os.path.exists(MASTER_FILE_NAME):
-    st.sidebar.success(f"✅ 마스터 연동 완료 (`{MASTER_FILE_NAME}`)")
+def parse_number(val):
     try:
-        barcode_to_mecode, name_to_mecode, delivery_map = load_master_data(MASTER_FILE_NAME)
-    except Exception as e:
-        st.sidebar.error(f"마스터 읽기 오류: {e}")
-else:
-    st.sidebar.error(f"❌ `{MASTER_FILE_NAME}` 파일 없음")
+        if pd.isna(val):
+            return 0
+        cleaned = re.sub(r"[^\d.-]", "", str(val))
+        return float(cleaned) if cleaned else 0
+    except Exception:
+        return 0
 
-order_file = st.sidebar.file_uploader("1. 납품확인서 목록 파일", type=["xlsx"])
-wms_file = st.sidebar.file_uploader("2. WMS 일일재고 파일", type=["xlsx"])
-
-# ---------------------------------------------------------
-# 3. 데이터 수주업로드 및 재고 매핑 처리
-# ---------------------------------------------------------
-if order_file and wms_file and os.path.exists(MASTER_FILE_NAME):
+# ============================================================
+# AUTOMATIC FILE PARSER
+# ============================================================
+def load_uploaded_file(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
+    
+    # 1. Excel (openpyxl / xlrd) 시도
     try:
-        df_order = pd.read_excel(order_file)
-        
-        # WMS 일일재고 컬럼 정밀 파싱
-        df_wms_raw = pd.read_excel(wms_file, header=None)
-        
-        header_row_idx = 1 if len(df_wms_raw) > 1 and '상품코드' in df_wms_raw.iloc[1].values else 0
-        df_wms = df_wms_raw.iloc[header_row_idx + 1:].copy()
-        
-        headers = [str(val).strip() for val in df_wms_raw.iloc[header_row_idx].values]
+        return pd.read_excel(BytesIO(raw_bytes), header=None)
+    except Exception:
+        pass
 
-        def get_col_idx(headers_list, keywords):
-            for kw in keywords:
-                for idx, h in enumerate(headers_list):
-                    if kw in h:
-                        return idx
-            return None
+    # 2. HTML Table 형태의 .xls 엑셀 파일 시도
+    try:
+        html_dfs = pd.read_html(BytesIO(raw_bytes))
+        if html_dfs:
+            return html_dfs[0]
+    except Exception:
+        pass
 
-        idx_mecode = get_col_idx(headers, ['상품코드', '상품'])
-        idx_name = get_col_idx(headers, ['상품명'])
-        idx_lot = get_col_idx(headers, ['화주LOT', 'LOT'])
-        idx_exp = get_col_idx(headers, ['유효일자', '유통기한'])
-        idx_box = get_col_idx(headers, ['입수량(BOX)', 'BOX입수'])
-        idx_tot_qty = get_col_idx(headers, ['합계수량', '정상수량'])
-        idx_barcode = get_col_idx(headers, ['상품바코드', '바코드'])
+    # 3. CSV 시도
+    for encoding in ["utf-8-sig", "cp949", "euc-kr", "utf-8", "latin1"]:
+        try:
+            return pd.read_csv(BytesIO(raw_bytes), encoding=encoding, header=None)
+        except Exception:
+            continue
 
-        wms_stock_data = pd.DataFrame({
-            'ME코드': df_wms.iloc[:, idx_mecode].astype(str).str.strip() if idx_mecode is not None else '',
-            '상품명': df_wms.iloc[:, idx_name].astype(str).str.strip() if idx_name is not None else '',
-            '화주LOT': df_wms.iloc[:, idx_lot].astype(str).str.strip() if idx_lot is not None else '',
-            '유효일자': pd.to_datetime(df_wms.iloc[:, idx_exp], errors='coerce') if idx_exp is not None else pd.NaT,
-            '입수량_BOX': pd.to_numeric(df_wms.iloc[:, idx_box], errors='coerce').fillna(1) if idx_box is not None else 1,
-            '합계수량': pd.to_numeric(df_wms.iloc[:, idx_tot_qty], errors='coerce').fillna(0) if idx_tot_qty is not None else 0,
-            '상품바코드': df_wms.iloc[:, idx_barcode].astype(str).str.replace('.0', '', regex=False).str.strip() if idx_barcode is not None else ''
+    raise ValueError("파일을 표준 형태로 읽을 수 없습니다. 확장자(.xlsx)를 확인해 주세요.")
+
+# ============================================================
+# WMS & DELIVERY FILE PARSERS
+# ============================================================
+def parse_grace_wms(df_raw):
+    """
+    그레이스 3PL WMS 재고 현황 파싱
+    - B열(1): 상품코드
+    - C열(2): 상품명
+    - D열(3): LOT
+    - E열(4): 유통기한
+    - G열(6): 바코드
+    - K열(10): 가용재고
+    """
+    header_idx = None
+    for idx, row in df_raw.iterrows():
+        row_str = " ".join(row.dropna().astype(str))
+        if "상품코드" in row_str and "LOT" in row_str:
+            header_idx = idx
+            break
+
+    if header_idx is None:
+        header_idx = 1
+
+    df = df_raw.iloc[header_idx + 1:].copy()
+    
+    parsed_rows = []
+    for _, row in df.iterrows():
+        wms_sku = clean_str(row.iloc[1]) if len(row) > 1 else ""
+        product_name = clean_str(row.iloc[2]) if len(row) > 2 else ""
+        lot = clean_str(row.iloc[3]) if len(row) > 3 else "NO_LOT"
+        exp_date_str = clean_str(row.iloc[4]) if len(row) > 4 else ""
+        barcode = clean_str(row.iloc[6]) if len(row) > 6 else ""
+        avail_qty = parse_number(row.iloc[10]) if len(row) > 10 else 0
+
+        if not wms_sku and not barcode and not product_name:
+            continue
+        if avail_qty <= 0:
+            continue
+
+        exp_date = pd.to_datetime(exp_date_str, errors="coerce")
+
+        parsed_rows.append({
+            "WMS상품코드": wms_sku,
+            "WMS상품명": product_name,
+            "LOT": lot,
+            "유통기한": exp_date,
+            "바코드": barcode,
+            "가용재고": avail_qty,
+            "가용재고_남은수량": avail_qty,
         })
 
-        wms_upload_list = []
-        today = datetime.now()
+    return pd.DataFrame(parsed_rows)
 
-        # 납품확인서 O열(BOX입수) 파싱
-        box_col_name = None
-        for c in df_order.columns:
-            if 'BOX입수' in str(c) or '박스입수' in str(c):
-                box_col_name = c
+
+def parse_oliveyoung_delivery(df_raw):
+    """
+    올리브영 납품확인서 목록 파싱
+    """
+    if "상품코드" in df_raw.columns:
+        df = df_raw.copy()
+    else:
+        header_idx = 0
+        for idx, row in df_raw.iterrows():
+            row_str = " ".join(row.dropna().astype(str))
+            if "상품코드" in row_str and "발주수량" in row_str:
+                header_idx = idx
                 break
 
-        for idx, row in df_order.iterrows():
-            item_name = str(row.get('상품명', '')).strip()
-            if not is_valid_text(item_name):
-                continue
+        df = df_raw.copy()
+        df.columns = df.iloc[header_idx].map(clean_str)
+        df = df.iloc[header_idx + 1:].reset_index(drop=True)
 
-            item_barcode = clean_barcode(row.get('상품코드', ''))
-            center_name = str(row.get('센터', '')).strip()
-            delivery_code = delivery_map.get(center_name, "미등록배송처")
+    df = df[df["상품코드"].notna() & (df["상품코드"] != "")].copy()
+    df["상품코드"] = df["상품코드"].apply(clean_str)
+    
+    req_col = [c for c in df.columns if "발주수량" in c]
+    box_col = [c for c in df.columns if "BOX" in c and "입수" in c]
+    
+    df["출고수량"] = df[req_col[0]].apply(parse_number) if req_col else 0
+    df["BOX입수"] = df[box_col[0]].apply(parse_number) if box_col else 1
+    df["입고예정일"] = pd.to_datetime(df["입고예정일"], errors="coerce")
 
-            try:
-                if box_col_name:
-                    order_box_pack = int(float(row.get(box_col_name, 1)))
-                elif len(row) > 14:
-                    order_box_pack = int(float(row.iloc[14]))
-                else:
-                    order_box_pack = 1
-            except:
-                order_box_pack = 1
+    return df
 
-            # 수주일자 / 납품일자 날짜 정제
-            raw_order_date = row.get('발주일자', today)
-            try:
-                dt_order = pd.to_datetime(raw_order_date)
-            except:
-                dt_order = today
+# ============================================================
+# AUTO MATCHING & ALLOCATION LOGIC
+# ============================================================
+def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
+    """
+    올영 바코드 = WMS G열(바코드) 매칭
+    상품코드 = WMS B열, 상품명 = WMS C열 적용
+    """
+    wms_work = wms_df.copy()
+    allocated_results = []
 
-            raw_arr_date = row.get('입고예정일', today)
-            try:
-                arr_dt = pd.to_datetime(raw_arr_date)
-            except:
-                arr_dt = today
+    for idx, d_row in delivery_df.iterrows():
+        barcode = d_row.get("상품코드", "")
+        req_qty = d_row.get("출고수량", 0)
+        box_in = d_row.get("BOX입수", 1)
+        target_date = d_row.get("입고예정일", pd.Timestamp.now())
 
-            # 📌 3PL WMS 수주일자/납품일자 = YYYYMMDD 포맷
-            wms_order_date_str = dt_order.strftime('%Y%m%d')
-            wms_arr_date_str = arr_dt.strftime('%Y%m%d')
-            
-            # 화면 표시용 YYYY-MM-DD 포맷
-            view_arr_date_str = arr_dt.strftime('%Y-%m-%d')
+        if pd.isna(target_date):
+            target_date = pd.Timestamp.now()
 
-            try:
-                order_qty = int(float(row.get('발주수량\n(EA)', row.get('발주수량', 0))))
-            except:
-                order_qty = 0
+        # 올영 바코드 = WMS G열(바코드) 또는 B열 매칭
+        matched_wms = wms_work[(wms_work["바코드"] == barcode) | (wms_work["WMS상품코드"] == barcode)].copy()
 
-            try:
-                unit_price = int(float(row.get('원단가', 0)))
-            except:
-                unit_price = 0
+        if not matched_wms.empty:
+            matched_wms["잔여일수"] = (matched_wms["유통기한"] - target_date).dt.days
+            # FEFO 유통기한 빠른 순 정렬
+            valid_wms = matched_wms[matched_wms["잔여일수"] >= min_days].sort_values("유통기한")
+            invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days]
+        else:
+            valid_wms = pd.DataFrame()
+            invalid_wms = pd.DataFrame()
 
-            try:
-                total_amount = int(float(row.get('원가금액', 0)))
-            except:
-                total_amount = unit_price * order_qty
+        remaining_to_pick = req_qty
+        picked_lots = []
+        status = "NORMAL"
 
-            vat_amount = int(total_amount * 0.1)
-
-            # MEcode 매핑
-            mecode = barcode_to_mecode.get(item_barcode, None)
-            if not mecode:
-                mecode = name_to_mecode.get(item_name, None)
-
-            selected_lot = ""
-            selected_exp_hyphen = ""  # 📌 유효일자 (YYYY-MM-DD: 하이픈 포함)
-            status = "정상"
-
-            if not mecode:
-                status = "검토필요"
+        if valid_wms.empty:
+            if not invalid_wms.empty:
+                status = "INVALID_SHELF_LIFE"
             else:
-                sub_stock = wms_stock_data[wms_stock_data['ME코드'] == mecode].copy()
+                status = "NO_STOCK"
+        else:
+            for w_idx, w_row in valid_wms.iterrows():
+                if remaining_to_pick <= 0:
+                    break
                 
-                if sub_stock.empty and item_barcode:
-                    sub_stock = wms_stock_data[wms_stock_data['상품바코드'] == item_barcode].copy()
-                
-                if sub_stock.empty and item_name:
-                    sub_stock = wms_stock_data[wms_stock_data['상품명'] == item_name].copy()
+                avail = w_row["가용재고_남은수량"]
+                if avail <= 0:
+                    continue
 
-                # 조건 1: 유효일자 1.5년(547일) 이상 남은 재고
-                min_valid_date = arr_dt + timedelta(days=547)
-                valid_stock = sub_stock[sub_stock['유효일자'] >= min_valid_date].copy()
+                take = min(avail, remaining_to_pick)
+                wms_work.loc[w_idx, "가용재고_남은수량"] -= take
+                remaining_to_pick -= take
 
-                # 조건 2: 박스 입수량 이상 재고
-                valid_stock = valid_stock[valid_stock['합계수량'] >= valid_stock['입수량_BOX']]
-                valid_stock = valid_stock.sort_values(by='유효일자', ascending=True)
+                exp_str = w_row["유통기한"].strftime("%Y-%m-%d") if pd.notna(w_row["유통기한"]) else "N/A"
+                picked_lots.append({
+                    "LOT": w_row["LOT"],
+                    "유통기한": exp_str,
+                    "수량": take,
+                    "WMS코드": w_row["WMS상품코드"],
+                    "WMS상품명": w_row["WMS상품명"]
+                })
 
-                if sub_stock.empty or valid_stock.empty:
-                    status = "검토필요"
-                else:
-                    single_lot_match = valid_stock[valid_stock['합계수량'] >= order_qty]
-                    if not single_lot_match.empty:
-                        best_match = single_lot_match.iloc[0]
-                        selected_lot = str(best_match['화주LOT'])
-                        if pd.notnull(best_match['유효일자']):
-                            selected_exp_hyphen = best_match['유효일자'].strftime('%Y-%m-%d')
-                    else:
-                        status = "검토필요"
+            if remaining_to_pick > 0:
+                status = "SHORTAGE"
 
-            wms_upload_list.append({
-                '출고구분': 0,
-                '수주일자_WMS': wms_order_date_str,   # YYYYMMDD
-                '납품일자_WMS': wms_arr_date_str,     # YYYYMMDD
-                '납품일자_VIEW': view_arr_date_str,   # YYYY-MM-DD
-                '발주처코드': '86100000',
-                '발주처': 'CJ올리브영',
-                '배송코드': delivery_code,
-                '배송지': center_name,
-                '상품코드': mecode if mecode else "미등록",
-                '상품명': item_name,
-                '입수량': order_box_pack,
-                '수량': order_qty,
-                '단가': unit_price,
-                '합계': total_amount,
-                '부가세': vat_amount,
-                'LOT': selected_lot,
-                '유효일자': selected_exp_hyphen,      # YYYY-MM-DD (하이픈 포함)
-                '매핑상태': status
-            })
+        # WMS B열 상품코드 및 WMS C열 상품명 매핑
+        wms_code_display = picked_lots[0]["WMS코드"] if picked_lots else (matched_wms["WMS상품코드"].iloc[0] if not matched_wms.empty else "-")
+        wms_name_display = picked_lots[0]["WMS상품명"] if picked_lots else (matched_wms["WMS상품명"].iloc[0] if not matched_wms.empty else "-")
 
-        df_result = pd.DataFrame(wms_upload_list)
+        lot_summary = [f"{p['LOT']}({int(p['수량'])}개)" for p in picked_lots]
+        exp_summary = list(set([p["유통기한"] for p in picked_lots]))
+        is_split = len(picked_lots) > 1
 
-        # ---------------------------------------------------------
-        # 4. 화면 대시보드 UI 구성
-        # ---------------------------------------------------------
-        st.title("🥝 올리브영 수주 자동화 매칭")
+        status_flag = "🟢 정상출고"
+        if status == "NO_STOCK":
+            status_flag = "🔴 재고없음"
+        elif status == "INVALID_SHELF_LIFE":
+            status_flag = "⛔ [출고불가] 유통기한 1년6개월 미만"
+        elif status == "SHORTAGE":
+            status_flag = f"🟡 수량부족 ({int(remaining_to_pick)}EA)"
+        elif is_split:
+            status_flag = "⚠️ [주의] LOT 쪼개짐"
 
-        total_cnt = len(df_result)
-        normal_cnt = len(df_result[df_result['매핑상태'] == '정상'])
-        check_cnt = total_cnt - normal_cnt
+        box_check = "OK"
+        if box_in > 0 and (req_qty % box_in != 0):
+            box_check = f"❌ 박스미달 (입수:{int(box_in)})"
 
-        col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
-        col1.metric("총 처리 건수", f"{total_cnt} 건")
-        col2.metric("✅ 자동 정상 매핑", f"{normal_cnt} 건")
-        col3.metric("⚠️ 검토 필요 건수", f"{check_cnt} 건", delta_color="inverse")
-
-        # 📌 WMS 복사용 순수 데이터프레임
-        # 수주일자, 납품일자 = YYYYMMDD / 유효일자 = YYYY-MM-DD
-        df_wms_pure = pd.DataFrame({
-            '출고구분': df_result['출고구분'],
-            '수주일자': df_result['수주일자_WMS'],
-            '납품일자': df_result['납품일자_WMS'],
-            '발주처코드': df_result['발주처코드'],
-            '발주처': df_result['발주처'],
-            '배송코드': df_result['배송코드'],
-            '배송지': df_result['배송지'],
-            '상품코드': df_result['상품코드'],
-            '상품명': df_result['상품명'],
-            '수량': df_result['수량'],
-            '단가': df_result['단가'],
-            '합계': df_result['합계'],
-            '부가세': df_result['부가세'],
-            'LOT': df_result['LOT'],
-            '유효일자': df_result['유효일자']
+        allocated_results.append({
+            "바코드": barcode,
+            "상품코드": wms_code_display,
+            "상품명": wms_name_display,
+            "BOX입수": int(box_in),
+            "출고수량": int(req_qty),
+            "LOT": " / ".join(lot_summary) if lot_summary else "-",
+            "유통기한": " / ".join(exp_summary) if exp_summary else "-",
+            "매핑상태": status_flag,
+            "박스입수체크": box_check,
         })
 
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-            df_wms_pure.to_excel(writer, index=False, sheet_name='WMS업로드_최종')
-            df_result.to_excel(writer, index=False, sheet_name='전체상세검토')
-        
-        col4.download_button(
-            label="📥 WMS 업로드용 엑셀 즉시 다운로드",
-            data=excel_buffer.getvalue(),
-            file_name=f"3PL_WMS_수주업로드_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+    return pd.DataFrame(allocated_results), wms_work
 
-        st.markdown("---")
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+st.title("📦 올리브영 자동 출고 & LOT 매핑 시스템 (그레이스 3PL)")
+st.caption("그레이스 WMS 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하여 LOT 및 유통기한을 배정합니다.")
 
-        # ---------------------------------------------------------
-        # 5. 탭 구성
-        # ---------------------------------------------------------
-        tab1, tab2 = st.tabs(["🔍 전체 데이터 확인", "📋 3PL WMS 복사용 양식"])
+st.sidebar.header("⚙️ 설정 옵션")
+min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
+min_days_limit = int(min_months * 30.4375)
 
-        with tab1:
-            st.caption("📌 핵심 처리 내역입니다. (검토필요 항목은 빨간색으로 강조 표시됩니다)")
-            
-            df_show = pd.DataFrame({
-                '납품일자': df_result['납품일자_VIEW'],
-                '배송코드': df_result['배송코드'],
-                '배송지': df_result['배송지'],
-                '상품코드': df_result['상품코드'],
-                '상품명': df_result['상품명'],
-                '입수량': df_result['입수량'],
-                '수량': df_result['수량'],
-                'LOT': df_result['LOT'],
-                '유효일자': df_result['유효일자'],
-                '매핑상태': df_result['매핑상태']
-            })
+col1, col2 = st.columns(2)
 
-            def highlight_status(row):
-                if str(row['매핑상태']) == '검토필요':
-                    return ['background-color: #f8d7da; color: #dc3545; font-weight: bold;'] * len(row)
-                return [''] * len(row)
+with col1:
+    st.subheader("1. 올리브영 납품확인서 목록 파일")
+    st.info("💡 올리브영 납품확인서 엑셀 다운로드 파일을 업로드해주세요.")
+    delivery_file = st.file_uploader("납품확인서 목록 파일 (.xlsx)", key="delivery")
 
-            styled_show = df_show.style.apply(highlight_status, axis=1)
-            st.dataframe(styled_show, height=500, use_container_width=True, hide_index=True)
+with col2:
+    st.subheader("2. 그레이스(wms) 재고파일")
+    st.warning("⚠️ 확장자가 .xls인 경우 업로드 시 오류가 발생할 수 있습니다. 확장자를 .xlsx로 변경하시거나, Microsoft Excel 2007 버전으로 다운받은 파일을 업로드해 주세요.")
+    wms_file = st.file_uploader("WMS 재고파일 (.xlsx, .xls)", key="wms")
 
-        with tab2:
-            st.caption("📌 **3PL WMS 시스템 입력용 표준 양식입니다. (수주/납품일자: YYYYMMDD, 유효일자: YYYY-MM-DD 포맷 적용)**")
-            st.dataframe(df_wms_pure, height=500, use_container_width=True, hide_index=True)
+if wms_file and delivery_file:
+    try:
+        wms_raw = load_uploaded_file(wms_file)
+        delivery_raw = load_uploaded_file(delivery_file)
+
+        wms_df = parse_grace_wms(wms_raw)
+        delivery_df = parse_oliveyoung_delivery(delivery_raw)
+
+        st.success(f"✅ 파일 읽기 성공! (WMS 가용재고: {len(wms_df)}건 / 올리브영 납품항목: {len(delivery_df)}건)")
+
+        if st.button("🚀 LOT 자동 매핑 및 출고 검증 실행", type="primary"):
+            result_df, updated_wms = allocate_inventory(delivery_df, wms_df, min_days=min_days_limit)
+
+            st.subheader("📊 자동 매핑 및 출고 검증 결과")
+
+            # KPI 요약
+            k1, k2, k3, k4 = st.columns(4)
+            normal_cnt = sum(result_df["매핑상태"].str.contains("정상출고"))
+            split_cnt = sum(result_df["매핑상태"].str.contains("LOT 쪼개짐"))
+            invalid_cnt = sum(result_df["매핑상태"].str.contains("출고불가"))
+            shortage_cnt = sum(result_df["매핑상태"].str.contains("부족|재고없음"))
+
+            k1.metric("🟢 정상 출고 가능", f"{normal_cnt} 건")
+            k2.metric("⚠️ LOT 쪼개짐 항목", f"{split_cnt} 건")
+            k3.metric("⛔ 유통기한 부적합", f"{invalid_cnt} 건")
+            k4.metric("🔴 재고 부족/없음", f"{shortage_cnt} 건")
+
+            # 필터 기능
+            status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
+            filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
+
+            # [바코드, 상품코드, 상품명, BOX입수, 출고수량, LOT, 유통기한] 순서로 출력
+            st.dataframe(filtered_result, use_container_width=True, height=500)
+
+            # Excel 다운로드
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                filtered_result.to_excel(writer, index=False, sheet_name="올리브영_LOT매핑결과")
+            excel_data = output.getvalue()
+
+            st.download_button(
+                label="📥 매핑 결과 엑셀 다운로드",
+                data=excel_data,
+                file_name=f"올리브영_LOT매핑결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
     except Exception as e:
-        st.error(f"처리 중 오류가 발생했습니다: {e}")
-else:
-    st.info("👈 왼쪽 사이드바에서 납품확인서와 WMS 일일재고 엑셀 파일을 업로드해 주세요.")
+        st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
+
+st.markdown("---")
+
+# ============================================================
+# PROGRAM USAGE GUIDE & ERROR HANDLING
+# ============================================================
+with st.expander("📖 올리브영 자동 출고 매핑 프로그램 사용 방법 및 오류 해결 안내", expanded=True):
+    st.markdown("""
+    ### 1. 사용 방법
+    1. **올리브영 납품확인서 목록 파일**과 **그레이스 WMS 재고 파일**을 각각 상단 업로드 영역에 첨부합니다.
+    2. **[🚀 LOT 자동 매핑 및 출고 검증 실행]** 버튼을 클릭합니다.
+    3. 결과 표에서 **`매핑상태`** 및 **`박스입수체크`** 항목을 확인합니다.
+    4. **[📥 매핑 결과 엑셀 다운로드]** 버튼을 눌러 결과 보고서를 저장합니다.
+
+    ---
+
+    ### 2. 매핑 및 검증 기준 안내
+    * **바코드 매칭**: 올리브영 납품확인서의 바코드와 그레이스 WMS G열(바코드)을 자동 매칭합니다.
+    * **상품코드/상품명**: 그레이스 WMS B열(상품코드) 및 C열(상품명) 정보를 가져와 표시합니다.
+    * **유통기한 기준 (1년 6개월)**: 입고예정일 기준 잔여 유통기한이 **547일(18개월) 미만**인 재고는 출고 대상에서 자동 제외되며 `⛔ [출고불가]`로 표기됩니다.
+    * **LOT 쪼개짐 태그**: single LOT 재고 부족으로 한 납품 품목에 2개 이상의 LOT가 나누어 매핑된 경우 `⚠️ [주의] LOT 쪼개짐`으로 표기됩니다.
+    * **박스 입수 체크**: 출고 수량이 박스 입수 단위로 깔끔하게 떨어지지 않을 경우 `❌ 박스미달` 경고가 발생합니다.
+
+    ---
+
+    ### 3. 파일 업로드 오류 해결 방법 (`application/vnd.ms-excel` 등)
+    * **원인**: WMS 시스템에서 내려받은 구형 `.xls` 파일은 보안/형식 문제로 웹 업로드가 거부될 수 있습니다.
+    * **해결책 (택 1)**:
+      1. WMS에서 **Export To Excel(저장)** 시 하단 **파일 형식(T)**을 **`Microsoft Excel 2007`**로 선택하고 저장 후 업로드합니다.
+      2. 다운로드받은 파일 이름 끝의 확장자를 **`.xls`에서 `.xlsx`로 변경**한 후 업로드합니다.
+    """)
