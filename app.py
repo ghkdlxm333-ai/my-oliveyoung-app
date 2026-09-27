@@ -399,12 +399,11 @@ def style_dataframe(df):
     return df.style.apply(highlight_rows, axis=1)
 
 # ============================================================
-# SIDEBAR WITH OLIVE YOUNG LOGO
+# SIDEBAR WITH OLIVE YOUNG LOGO (최신 Streamlit 파라미터 적용)
 # ============================================================
-# 올리브영 로고 배치
 st.sidebar.image(
     "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Olive_Young_Logo.svg/2560px-Olive_Young_Logo.svg.png",
-    use_column_width=True,
+    use_container_width=True,
 )
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ 설정 옵션")
