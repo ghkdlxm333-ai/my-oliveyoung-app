@@ -36,7 +36,7 @@ def parse_number(val):
         return 0
 
 # ============================================================
-# AUTOMATIC FILE PARSER (.xls, .xlsx, HTML, CSV 스마트 파싱)
+# AUTOMATIC FILE PARSER
 # ============================================================
 def load_uploaded_file(uploaded_file):
     raw_bytes = uploaded_file.getvalue()
@@ -75,6 +75,7 @@ def parse_grace_wms(df_raw):
     - D열(3): LOT
     - E열(4): 유통기한
     - G열(6): 바코드
+    - H열(7): 창고 (정상창고만 선택)
     - K열(10): 가용재고
     """
     header_idx = None
@@ -96,11 +97,15 @@ def parse_grace_wms(df_raw):
         lot = clean_str(row.iloc[3]) if len(row) > 3 else "NO_LOT"
         exp_date_str = clean_str(row.iloc[4]) if len(row) > 4 else ""
         barcode = clean_str(row.iloc[6]) if len(row) > 6 else ""
+        warehouse = clean_str(row.iloc[7]) if len(row) > 7 else ""
         avail_qty = parse_number(row.iloc[10]) if len(row) > 10 else 0
 
         if not wms_sku and not barcode and not product_name:
             continue
         if avail_qty <= 0:
+            continue
+        # H열 정상창고 재고만 출고가능 재고로 인정
+        if warehouse != "정상창고":
             continue
 
         exp_date = pd.to_datetime(exp_date_str, errors="coerce")
@@ -111,6 +116,7 @@ def parse_grace_wms(df_raw):
             "LOT": lot,
             "유통기한": exp_date,
             "바코드": barcode,
+            "창고": warehouse,
             "가용재고": avail_qty,
             "가용재고_남은수량": avail_qty,
         })
@@ -149,13 +155,14 @@ def parse_oliveyoung_delivery(df_raw):
     return df
 
 # ============================================================
-# AUTO MATCHING & ALLOCATION LOGIC (SINGLE LOT PRIORITY)
+# AUTO MATCHING & ALLOCATION LOGIC
 # ============================================================
 def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
     """
-    - 납품센터: 양지센터, 양지온라인센터, 경산센터 구분
-    - 올영 바코드 = WMS G열(바코드) 매칭
-    - LOT 쪼개짐 최소화: 단일 LOT로 수량 충당 가능한 경우 우선 매핑
+    - 상품명: 올리브영 납품확인서 기준
+    - 창고: H열 '정상창고' 재고만 출고 대상
+    - LOT 표시: LOT명(현재창고재고: XX개)
+    - 태그: LOT 쪼개짐 ➡️ '⚠️ LOT 분할'
     """
     wms_work = wms_df.copy()
     allocated_results = []
@@ -164,12 +171,13 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         barcode = d_row.get("상품코드", "")
         req_qty = d_row.get("출고수량", 0)
         box_in = d_row.get("BOX입수", 1)
+        oy_product_name = str(d_row.get("상품명", "")).strip()  # 올영 목록 상품명 사용
         target_date = d_row.get("입고예정일", pd.Timestamp.now())
 
         if pd.isna(target_date):
             target_date = pd.Timestamp.now()
 
-        # Center name classification
+        # Center classification
         raw_center = str(d_row.get("센터", "")).strip()
         if "양지온라인" in raw_center:
             center = "양지온라인센터"
@@ -185,7 +193,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 
         if not matched_wms.empty:
             matched_wms["잔여일수"] = (matched_wms["유통기한"] - target_date).dt.days
-            # 유통기한 1년6개월(547일) 이상 적합 재고만 필터링 (유통기한 빠른 순)
+            # 유통기한 1년 6개월(547일) 이상 적합 정상창고 재고만 필터링
             valid_wms = matched_wms[matched_wms["잔여일수"] >= min_days].sort_values("유통기한")
             invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days]
         else:
@@ -201,11 +209,10 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
             else:
                 status = "NO_STOCK"
         else:
-            # 1. 단일 LOT 탐색 (출고 수량을 혼자 완벽히 채울 수 있는 LOT가 있는지)
+            # 1. 단일 LOT 탐색 (출고수량을 충당 가능한 단일 LOT가 있는지)
             single_sufficient = valid_wms[valid_wms["가용재고_남은수량"] >= req_qty]
 
             if not single_sufficient.empty:
-                # 유통기한이 가장 빠른 단일 LOT 1개 선택
                 s_row = single_sufficient.iloc[0]
                 w_idx = s_row.name
                 wms_work.loc[w_idx, "가용재고_남은수량"] -= req_qty
@@ -214,13 +221,12 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
                 picked_lots.append({
                     "LOT": s_row["LOT"],
                     "유통기한": exp_str,
-                    "수량": req_qty,
-                    "WMS코드": s_row["WMS상품코드"],
-                    "WMS상품명": s_row["WMS상품명"]
+                    "창고재고수량": int(s_row["가용재고"]), # 현재 창고 내 실제 가용재고 수량
+                    "WMS코드": s_row["WMS상품코드"]
                 })
                 status = "NORMAL"
             else:
-                # 2. 단일 LOT로 불가능할 때만 어쩔 수 없이 분할 매핑(LOT 쪼개짐)
+                # 2. 단일 LOT로 부족할 때만 LOT 분할 매핑
                 remaining_to_pick = req_qty
                 for w_idx, w_row in valid_wms.iterrows():
                     if remaining_to_pick <= 0:
@@ -237,18 +243,16 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
                     picked_lots.append({
                         "LOT": w_row["LOT"],
                         "유통기한": exp_str,
-                        "수량": take,
-                        "WMS코드": w_row["WMS상품코드"],
-                        "WMS상품명": w_row["WMS상품명"]
+                        "창고재고수량": int(w_row["가용재고"]), # 현재 창고 내 실제 가용재고 수량
+                        "WMS코드": w_row["WMS상품코드"]
                     })
 
                 status = "SHORTAGE" if remaining_to_pick > 0 else "SPLIT"
 
-        # WMS B열 상품코드 및 WMS C열 상품명 매핑
         wms_code_display = picked_lots[0]["WMS코드"] if picked_lots else (matched_wms["WMS상품코드"].iloc[0] if not matched_wms.empty else "-")
-        wms_name_display = picked_lots[0]["WMS상품명"] if picked_lots else (matched_wms["WMS상품명"].iloc[0] if not matched_wms.empty else "-")
 
-        lot_summary = [f"{p['LOT']}({int(p['수량'])}개)" for p in picked_lots]
+        # LOT 옆에 현재 창고 보유 재고수량 표시
+        lot_summary = [f"{p['LOT']}(현재창고재고:{p['창고재고수량']}개)" for p in picked_lots]
         exp_summary = list(set([p["유통기한"] for p in picked_lots]))
         is_split = len(picked_lots) > 1
 
@@ -260,7 +264,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         elif status == "SHORTAGE":
             status_flag = f"🟡 수량부족"
         elif is_split or status == "SPLIT":
-            status_flag = "⚠️ [주의] LOT 쪼개짐 (분할출고)"
+            status_flag = "⚠️ LOT 분할"
 
         box_check = "OK"
         if box_in > 0 and (req_qty % box_in != 0):
@@ -270,7 +274,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
             "납품센터": center,
             "바코드": barcode,
             "상품코드": wms_code_display,
-            "상품명": wms_name_display,
+            "상품명": oy_product_name, # 올리브영 납품확인서 기준 상품명
             "BOX입수": int(box_in),
             "출고수량": int(req_qty),
             "LOT": " / ".join(lot_summary) if lot_summary else "-",
@@ -285,13 +289,13 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 # STREAMLIT UI
 # ============================================================
 st.title("📦 올리브영 자동 출고 & LOT 매핑 시스템 (그레이스 3PL)")
-st.caption("그레이스 WMS 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하여 LOT 및 유통기한을 배정합니다.")
+st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하여 LOT 및 유통기한을 배정합니다.")
 
 st.sidebar.header("⚙️ 설정 옵션")
 min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
 min_days_limit = int(min_months * 30.4375)
 
-# 1. 파일 업로드 박스 동일 위치 수평 정렬
+# 수평 정렬 업로드 영역
 col1, col2 = st.columns(2)
 
 with col1:
@@ -310,7 +314,7 @@ with col2:
         help="※ .xls 업로드 오류 발생 시 Microsoft Excel 2007 버전으로 저장 후 업로드하세요."
     )
 
-# 2. 두 파일 모두 업로드되면 버튼 클릭 없이 즉시 자동 매핑 및 전체 데이터 표출
+# 자동 매핑 및 표출
 if wms_file and delivery_file:
     try:
         wms_raw = load_uploaded_file(wms_file)
@@ -319,7 +323,6 @@ if wms_file and delivery_file:
         wms_df = parse_grace_wms(wms_raw)
         delivery_df = parse_oliveyoung_delivery(delivery_raw)
 
-        # 즉시 매핑 로직 수행
         result_df, updated_wms = allocate_inventory(delivery_df, wms_df, min_days=min_days_limit)
 
         st.markdown("---")
@@ -328,12 +331,12 @@ if wms_file and delivery_file:
         # KPI 요약
         k1, k2, k3, k4 = st.columns(4)
         normal_cnt = sum(result_df["매핑상태"].str.contains("정상출고"))
-        split_cnt = sum(result_df["매핑상태"].str.contains("LOT 쪼개짐"))
+        split_cnt = sum(result_df["매핑상태"].str.contains("LOT 분할"))
         invalid_cnt = sum(result_df["매핑상태"].str.contains("출고불가"))
         shortage_cnt = sum(result_df["매핑상태"].str.contains("부족|재고없음"))
 
         k1.metric("🟢 정상 출고 가능", f"{normal_cnt} 건")
-        k2.metric("⚠️ LOT 쪼개짐 항목", f"{split_cnt} 건")
+        k2.metric("⚠️ LOT 분할 항목", f"{split_cnt} 건")
         k3.metric("⛔ 유통기한 부적합", f"{invalid_cnt} 건")
         k4.metric("🔴 재고 부족/없음", f"{shortage_cnt} 건")
 
@@ -341,10 +344,9 @@ if wms_file and delivery_file:
         status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
         filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
 
-        # 요청받은 데이터 컬럼 출력: [납품센터, 바코드, 상품코드, 상품명, BOX입수, 출고수량, LOT, 유통기한, 매핑상태, 박스입수체크]
         st.dataframe(filtered_result, use_container_width=True, height=520)
 
-        # Excel 다운로드 제공
+        # Excel 다운로드
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             filtered_result.to_excel(writer, index=False, sheet_name="올리브영_LOT매핑결과")
@@ -370,13 +372,14 @@ st.markdown("---")
 with st.expander("📖 올리브영 자동 출고 매핑 프로그램 사용 방법 및 오류 해결 안내", expanded=False):
     st.markdown("""
     ### 1. 주요 기능 및 자동 매핑 로직
-    * **자동 실행**: 두 파일을 올리는 즉시 버튼 클릭 없이 전체 데이터가 자동 검증되어 나타납니다.
-    * **납품센터 구분**: `양지센터`, `양지온라인센터`, `경산센터` 등으로 센터명을 구분하여 표시합니다.
-    * **단일 LOT 우선 배정**: 수량을 충당할 수 있는 단일 LOT가 존재할 경우 LOT 쪼개짐 없이 **하나의 LOT로 우선 출고**합니다.
-    * **유통기한 1년 6개월 검증**: 입고예정일 기준 **547일(18개월) 미만** 재고는 출고 대상에서 자동 제외되며 `⛔ [출고불가]` 처리됩니다.
+    * **자동 실행**: 두 파일을 올리는 즉시 전체 데이터가 자동 매핑되어 수량 및 LOT가 배정됩니다.
+    * **정상창고 재고만 출고**: WMS H열 창고명이 **'정상창고'**인 재고만 출고 대상 재고로 필터링합니다.
+    * **상품명 표시**: 재고 유무와 상관없이 **올리브영 납품확인서 기준의 상품명**이 항상 보입니다.
+    * **LOT 표시 예시**: `LOT명(현재창고재고: XX개)` 형태로 창고 잔여 수량을 명확히 표시합니다.
+    * **단일 LOT 우선 배정**: 출고 수량을 채울 수 있는 단일 LOT를 우선 매핑하며, 불가능할 때만 `⚠️ LOT 분할`로 처리됩니다.
 
     ---
 
     ### 2. `.xls` 파일 업로드 오류 해결책
-    * WMS 다운로드(Export To Excel) 시 파일 형식을 **`Microsoft Excel 2007`**로 선택하고 저장하거나, 파일 확장자를 **`.xlsx`**로 수정 후 업로드해 주세요.
+    * WMS에서 다운로드(Export To Excel) 시 파일 형식을 **`Microsoft Excel 2007`**로 선택 후 저장하시거나 확장자를 **`.xlsx`**로 수정하여 업로드하세요.
     """)
