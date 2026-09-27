@@ -8,7 +8,7 @@ import streamlit as st
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="올리브영 자동 출고 & LOT 매핑 (그레이스 3PL)",
+    page_title="올리브영 LOT 매핑 & 3PL 교차 검증기",
     page_icon="📦",
     layout="wide",
 )
@@ -70,13 +70,7 @@ def load_uploaded_file(uploaded_file):
 def parse_grace_wms(df_raw):
     """
     그레이스 3PL WMS 재고 현황 파싱
-    - B열(1): 상품코드
-    - C열(2): 상품명
-    - D열(3): LOT
-    - E열(4): 유통기한
-    - G열(6): 바코드
-    - H열(7): 창고 (정상창고만 선택)
-    - K열(10): 가용재고
+    - H열(7) '정상창고' 재고만 선택
     """
     header_idx = None
     for idx, row in df_raw.iterrows():
@@ -154,14 +148,84 @@ def parse_oliveyoung_delivery(df_raw):
 
     return df
 
+
+def parse_grace_delivery_confirmation(file_obj):
+    """
+    그레이스 3PL 출고확인 파일 파싱 (센터별 시트 자동 처리)
+    """
+    xls = pd.ExcelFile(BytesIO(file_obj.getvalue()))
+    grace_rows = []
+    
+    for sheet in xls.sheet_names:
+        try:
+            df_sheet = pd.read_excel(xls, sheet_name=sheet)
+            if df_sheet.empty:
+                continue
+            
+            barcode_col = None
+            qty_col = None
+            exp_col = None
+            lot_col = None
+            center_col = None
+            
+            for col in df_sheet.columns:
+                c_str = str(col).replace("\n", "").strip()
+                if "바코드" in c_str: barcode_col = col
+                elif "출고수량" in c_str or "수량" in c_str: qty_col = col
+                elif "유통기한" in c_str: exp_col = col
+                elif "제조일자" in c_str or "LOT" in c_str: lot_col = col
+                elif "센터" in c_str: center_col = col
+                
+            for _, row in df_sheet.iterrows():
+                raw_barcode = row.get(barcode_col, "") if barcode_col else ""
+                if pd.isna(raw_barcode) or not str(raw_barcode).strip():
+                    continue
+                try:
+                    barcode = str(int(raw_barcode))
+                except Exception:
+                    barcode = str(raw_barcode).strip()
+                    if barcode.endswith(".0"): barcode = barcode[:-2]
+                    
+                raw_center = str(row.get(center_col, sheet)).strip() if center_col else str(sheet).strip()
+                if "양지온라인" in raw_center: center = "양지온라인센터"
+                elif "양지" in raw_center: center = "양지센터"
+                elif "경산" in raw_center: center = "경산센터"
+                else: center = raw_center
+                
+                out_qty = parse_number(row.get(qty_col, 0)) if qty_col else 0
+                
+                exp_val = pd.to_datetime(row.get(exp_col, None), errors="coerce") if exp_col else pd.NaT
+                exp_str = exp_val.strftime("%Y-%m-%d") if pd.notna(exp_val) else ""
+                
+                lot_val = str(row.get(lot_col, "")).strip() if lot_col and pd.notna(row.get(lot_col)) else ""
+                if lot_val.endswith(".0"): lot_val = lot_val[:-2]
+                
+                grace_rows.append({
+                    "센터": center,
+                    "바코드": barcode,
+                    "출고수량": out_qty,
+                    "유통기한": exp_str,
+                    "LOT": lot_val
+                })
+        except Exception:
+            continue
+            
+    df_grace = pd.DataFrame(grace_rows)
+    if df_grace.empty:
+        return pd.DataFrame()
+        
+    grouped = df_grace.groupby(["센터", "바코드"]).agg({
+        "출고수량": "sum",
+        "유통기한": lambda x: " / ".join(sorted(list(set([s for s in x if s])))),
+        "LOT": lambda x: " / ".join(sorted(list(set([s for s in x if s]))))
+    }).reset_index()
+    
+    return grouped
+
 # ============================================================
 # AUTO MATCHING & ALLOCATION LOGIC
 # ============================================================
-def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
-    """
-    - 유통기한 미달인 재고도 LOT 및 유통기한을 표시하여 사람이 판단 가능하도록 조치
-    - LOT (현재재고) 간소화: LOT명(숫자)
-    """
+def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_SHELF_LIFE_DAYS):
     wms_work = wms_df.copy()
     allocated_results = []
 
@@ -203,7 +267,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         if valid_wms.empty:
             if not invalid_wms.empty:
                 status = "INVALID_SHELF_LIFE"
-                # 유통기한 미달 재고도 정보 표시를 위해 수집
+                # 유통기한 미달 항목도 LOT 및 유통기한 정보 수집
                 for _, inv_row in invalid_wms.iterrows():
                     exp_str = inv_row["유통기한"].strftime("%Y-%m-%d") if pd.notna(inv_row["유통기한"]) else "N/A"
                     picked_lots.append({
@@ -215,7 +279,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
             else:
                 status = "NO_STOCK"
         else:
-            # 1. 단일 LOT 우선 탐색
+            # 1. 단일 LOT 탐색
             single_sufficient = valid_wms[valid_wms["가용재고_남은수량"] >= req_qty]
 
             if not single_sufficient.empty:
@@ -257,9 +321,9 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 
         wms_code_display = picked_lots[0]["WMS코드"] if picked_lots else (matched_wms["WMS상품코드"].iloc[0] if not matched_wms.empty else "-")
 
-        # LOT(현재재고) 포맷 변경: LOT명(숫자)
         lot_summary = [f"{p['LOT']}({p['창고재고수량']})" for p in picked_lots]
         exp_summary = list(set([p["유통기한"] for p in picked_lots]))
+        sys_exp_str = " / ".join(exp_summary) if exp_summary else "-"
         is_split = len(picked_lots) > 1
 
         status_flag = "🟢 정상출고"
@@ -272,9 +336,26 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         elif is_split or status == "SPLIT":
             status_flag = "⚠️ LOT 분할"
 
-        box_check = "OK"
-        if box_in > 0 and (req_qty % box_in != 0):
-            box_check = f"❌ 박스미달 (입수:{int(box_in)})"
+        # 그레이스 3PL 파일과의 데이터 교차 검증
+        grace_check = "-"
+        if grace_confirm_df is not None and not grace_confirm_df.empty:
+            g_match = grace_confirm_df[(grace_confirm_df["센터"] == center) & (grace_confirm_df["바코드"] == barcode)]
+            if g_match.empty:
+                grace_check = "⚠️ 3PL 미확인"
+            else:
+                g_qty = int(g_match.iloc[0]["출고수량"])
+                g_exp = str(g_match.iloc[0]["유통기한"])
+                
+                diffs = []
+                if int(req_qty) != g_qty:
+                    diffs.append(f"수량차이(시스템:{int(req_qty)} / 3PL:{g_qty})")
+                if sys_exp_str != g_exp and sys_exp_str != "-" and g_exp != "":
+                    diffs.append(f"유통기한차이(시스템:{sys_exp_str} / 3PL:{g_exp})")
+                    
+                if not diffs:
+                    grace_check = "✅ 일치"
+                else:
+                    grace_check = f"❌ 불일치 ({', '.join(diffs)})"
 
         allocated_results.append({
             "납품센터": center,
@@ -284,9 +365,9 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
             "BOX입수": int(box_in),
             "출고수량": int(req_qty),
             "LOT (현재재고)": " / ".join(lot_summary) if lot_summary else "-",
-            "유통기한": " / ".join(exp_summary) if exp_summary else "-",
+            "유통기한": sys_exp_str,
             "매핑상태": status_flag,
-            "박스입수체크": box_check,
+            "3PL 검증": grace_check,
         })
 
     return pd.DataFrame(allocated_results), wms_work
@@ -315,32 +396,41 @@ def style_dataframe(df):
 # ============================================================
 # STREAMLIT UI
 # ============================================================
-st.title("📦 올리브영 자동 출고 & LOT 매핑 시스템 (그레이스 3PL)")
-st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하여 LOT 및 유통기한을 배정합니다.")
+st.title("📦 올리브영 LOT 매핑 & 3PL 교차 검증기")
+st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하고, 3PL 출고파일과 교차 검증합니다.")
 
 st.sidebar.header("⚙️ 설정 옵션")
 min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
 min_days_limit = int(min_months * 30.4375)
 
-# 파일 업로드 동일 라인
-col1, col2 = st.columns(2)
+# 3개 파일 업로드 수평 정렬
+col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.subheader("1. 올리브영 납품확인서 목록 파일")
+    st.subheader("1. 올리브영 납품확인서")
     delivery_file = st.file_uploader(
-        "올리브영 납품확인서 엑셀(.xlsx) 파일 업로드",
+        "올리브영 납품확인서 엑셀(.xlsx)",
         key="delivery",
-        help="올리브영 시스템에서 다운로드받은 납품확인서 목록 엑셀 파일을 업로드하세요."
+        help="올리브영 시스템에서 다운로드받은 납품확인서 목록 파일입니다."
     )
 
 with col2:
-    st.subheader("2. 그레이스(wms) 재고파일")
+    st.subheader("2. 그레이스 WMS 재고")
     wms_file = st.file_uploader(
-        "그레이스 WMS 재고(.xlsx, .xls) 파일 업로드",
+        "그레이스 WMS 재고파일 (.xlsx, .xls)",
         key="wms",
-        help="※ .xls 업로드 오류 발생 시 Microsoft Excel 2007 버전으로 저장 후 업로드하세요."
+        help="※ .xls 업로드 오류 시 Microsoft Excel 2007 버전으로 저장 후 업로드하세요."
     )
 
+with col3:
+    st.subheader("3. 그레이스 3PL 출고확인 (선택)")
+    grace_file = st.file_uploader(
+        "그레이스 3PL 출고확인 파일 (.xlsx)",
+        key="grace_confirm",
+        help="그레이스 3PL에서 송부받은 센터별 시트 분리 출고확인 파일입니다."
+    )
+
+# 파일 업로드 즉시 자동 실행
 if wms_file and delivery_file:
     try:
         wms_raw = load_uploaded_file(wms_file)
@@ -349,10 +439,14 @@ if wms_file and delivery_file:
         wms_df = parse_grace_wms(wms_raw)
         delivery_df = parse_oliveyoung_delivery(delivery_raw)
 
-        result_df, updated_wms = allocate_inventory(delivery_df, wms_df, min_days=min_days_limit)
+        grace_confirm_df = None
+        if grace_file is not None:
+            grace_confirm_df = parse_grace_delivery_confirmation(grace_file)
+
+        result_df, updated_wms = allocate_inventory(delivery_df, wms_df, grace_confirm_df, min_days=min_days_limit)
 
         st.markdown("---")
-        st.subheader("📊 전체 출고 자동 매핑 결과")
+        st.subheader("📊 전체 출고 매핑 & 3PL 교차 검증 결과")
 
         # KPI 요약
         k1, k2, k3, k4 = st.columns(4)
@@ -370,40 +464,40 @@ if wms_file and delivery_file:
         status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
         filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
 
-        # 색상 하이라이트가 포함된 표 출력
         styled_result = style_dataframe(filtered_result)
         st.dataframe(styled_result, use_container_width=True, height=520)
 
         # Excel 다운로드
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            filtered_result.to_excel(writer, index=False, sheet_name="올리브영_LOT매핑결과")
+            filtered_result.to_excel(writer, index=False, sheet_name="올리브영_3PL검증결과")
         excel_data = output.getvalue()
 
         st.download_button(
-            label="📥 매핑 결과 엑셀 다운로드",
+            label="📥 매핑 & 교차 검증 결과 엑셀 다운로드",
             data=excel_data,
-            file_name=f"올리브영_LOT매핑결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            file_name=f"올리브영_3PL검증결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
         st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
 else:
-    st.info("💡 상단에 납품확인서 파일과 WMS 재고파일을 모두 올리시면 자동으로 매핑 결과가 표출됩니다.")
+    st.info("💡 1번 올리브영 납품확인서와 2번 그레이스 WMS 재고파일을 올려주시면 즉시 매핑 표가 나타납니다. 3번 3PL 출고확인 파일을 함께 올리시면 3PL 실시간 교차 검증 결과까지 표시됩니다.")
 
 st.markdown("---")
 
 # ============================================================
 # PROGRAM USAGE GUIDE & ERROR HANDLING
 # ============================================================
-with st.expander("📖 올리브영 자동 출고 매핑 프로그램 사용 방법 및 오류 해결 안내", expanded=False):
+with st.expander("📖 올리브영 자동 출고 매핑 & 3PL 검증기 사용 방법 및 색상 안내", expanded=False):
     st.markdown("""
     ### 1. 주요 기능 및 색상 구분 안내
     * **🔴 빨간색 배경**: 재고가 아예 없는 항목 (`🔴 재고없음`)
-    * **⚠️ 파란색 배경**: 단일 LOT로 수량이 부족하여 나누어 출고되는 항목 (`⚠️ LOT 분할`)
+    * **⚠️ 파란색 배경**: 단일 LOT 수량이 부족하여 나누어 출고되는 항목 (`⚠️ LOT 분할`)
     * **⛔ 노란색 배경**: 잔여 유통기한 1년 6개월(547일) 미만으로 올리브영 입고 불가한 항목 (`⛔ [출고불가] 유통기한 1년6개월 미만`)
-    * **`LOT (현재재고)` 표기**: `LOT명(현재창고보유수량)`으로 출력되어 잔여 재고 확인이 용이합니다.
+    * **`3PL 검증` 컬럼**: 3번 파일(그레이스 3PL 출고확인)을 함께 첨부하면 **센터별 시트(양지/경산 등)**를 자동 분석하여 출고수량 및 유통기한의 일치 여부를 `✅ 일치` / `❌ 불일치`로 표시합니다.
+    * **`LOT (현재재고)` 표기**: `LOT명(숫자)`으로 표기되어 각 LOT별 보유 잔여 재고 확인이 용이합니다.
 
     ---
 
