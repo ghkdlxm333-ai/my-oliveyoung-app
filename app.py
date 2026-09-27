@@ -159,10 +159,8 @@ def parse_oliveyoung_delivery(df_raw):
 # ============================================================
 def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
     """
-    - 상품명: 올리브영 납품확인서 기준
-    - 창고: H열 '정상창고' 재고만 출고 대상
-    - LOT 표시: LOT명(현재창고재고: XX개)
-    - 태그: LOT 쪼개짐 ➡️ '⚠️ LOT 분할'
+    - 유통기한 미달인 재고도 LOT 및 유통기한을 표시하여 사람이 판단 가능하도록 조치
+    - LOT (현재재고) 간소화: LOT명(숫자)
     """
     wms_work = wms_df.copy()
     allocated_results = []
@@ -171,7 +169,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         barcode = d_row.get("상품코드", "")
         req_qty = d_row.get("출고수량", 0)
         box_in = d_row.get("BOX입수", 1)
-        oy_product_name = str(d_row.get("상품명", "")).strip()  # 올영 목록 상품명 사용
+        oy_product_name = str(d_row.get("상품명", "")).strip()
         target_date = d_row.get("입고예정일", pd.Timestamp.now())
 
         if pd.isna(target_date):
@@ -188,14 +186,13 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         else:
             center = raw_center if raw_center else "기타센터"
 
-        # 올영 바코드 = WMS G열(바코드) 또는 B열 매칭
+        # 바코드/SKU 매칭
         matched_wms = wms_work[(wms_work["바코드"] == barcode) | (wms_work["WMS상품코드"] == barcode)].copy()
 
         if not matched_wms.empty:
             matched_wms["잔여일수"] = (matched_wms["유통기한"] - target_date).dt.days
-            # 유통기한 1년 6개월(547일) 이상 적합 정상창고 재고만 필터링
             valid_wms = matched_wms[matched_wms["잔여일수"] >= min_days].sort_values("유통기한")
-            invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days]
+            invalid_wms = matched_wms[matched_wms["잔여일수"] < min_days].sort_values("유통기한", ascending=False)
         else:
             valid_wms = pd.DataFrame()
             invalid_wms = pd.DataFrame()
@@ -206,10 +203,19 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
         if valid_wms.empty:
             if not invalid_wms.empty:
                 status = "INVALID_SHELF_LIFE"
+                # 유통기한 미달 재고도 정보 표시를 위해 수집
+                for _, inv_row in invalid_wms.iterrows():
+                    exp_str = inv_row["유통기한"].strftime("%Y-%m-%d") if pd.notna(inv_row["유통기한"]) else "N/A"
+                    picked_lots.append({
+                        "LOT": inv_row["LOT"],
+                        "유통기한": exp_str,
+                        "창고재고수량": int(inv_row["가용재고"]),
+                        "WMS코드": inv_row["WMS상품코드"]
+                    })
             else:
                 status = "NO_STOCK"
         else:
-            # 1. 단일 LOT 탐색 (출고수량을 충당 가능한 단일 LOT가 있는지)
+            # 1. 단일 LOT 우선 탐색
             single_sufficient = valid_wms[valid_wms["가용재고_남은수량"] >= req_qty]
 
             if not single_sufficient.empty:
@@ -221,12 +227,12 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
                 picked_lots.append({
                     "LOT": s_row["LOT"],
                     "유통기한": exp_str,
-                    "창고재고수량": int(s_row["가용재고"]), # 현재 창고 내 실제 가용재고 수량
+                    "창고재고수량": int(s_row["가용재고"]),
                     "WMS코드": s_row["WMS상품코드"]
                 })
                 status = "NORMAL"
             else:
-                # 2. 단일 LOT로 부족할 때만 LOT 분할 매핑
+                # 2. LOT 분할
                 remaining_to_pick = req_qty
                 for w_idx, w_row in valid_wms.iterrows():
                     if remaining_to_pick <= 0:
@@ -243,7 +249,7 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
                     picked_lots.append({
                         "LOT": w_row["LOT"],
                         "유통기한": exp_str,
-                        "창고재고수량": int(w_row["가용재고"]), # 현재 창고 내 실제 가용재고 수량
+                        "창고재고수량": int(w_row["가용재고"]),
                         "WMS코드": w_row["WMS상품코드"]
                     })
 
@@ -251,8 +257,8 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
 
         wms_code_display = picked_lots[0]["WMS코드"] if picked_lots else (matched_wms["WMS상품코드"].iloc[0] if not matched_wms.empty else "-")
 
-        # LOT 옆에 현재 창고 보유 재고수량 표시
-        lot_summary = [f"{p['LOT']}(현재창고재고:{p['창고재고수량']}개)" for p in picked_lots]
+        # LOT(현재재고) 포맷 변경: LOT명(숫자)
+        lot_summary = [f"{p['LOT']}({p['창고재고수량']})" for p in picked_lots]
         exp_summary = list(set([p["유통기한"] for p in picked_lots]))
         is_split = len(picked_lots) > 1
 
@@ -274,16 +280,37 @@ def allocate_inventory(delivery_df, wms_df, min_days=MIN_SHELF_LIFE_DAYS):
             "납품센터": center,
             "바코드": barcode,
             "상품코드": wms_code_display,
-            "상품명": oy_product_name, # 올리브영 납품확인서 기준 상품명
+            "상품명": oy_product_name,
             "BOX입수": int(box_in),
             "출고수량": int(req_qty),
-            "LOT": " / ".join(lot_summary) if lot_summary else "-",
+            "LOT (현재재고)": " / ".join(lot_summary) if lot_summary else "-",
             "유통기한": " / ".join(exp_summary) if exp_summary else "-",
             "매핑상태": status_flag,
             "박스입수체크": box_check,
         })
 
     return pd.DataFrame(allocated_results), wms_work
+
+# ============================================================
+# ROW HIGHLIGHTING FUNCTION
+# ============================================================
+def style_dataframe(df):
+    """
+    - 재고없음: 빨강색 (#FFE6E6)
+    - LOT 분할: 파랑색 (#E6F2FF)
+    - 유통기한 미달: 노랑색 (#FFF9E6)
+    """
+    def highlight_rows(row):
+        status = str(row.get("매핑상태", ""))
+        if "재고없음" in status:
+            return ["background-color: #ffe6e6"] * len(row)
+        elif "LOT 분할" in status:
+            return ["background-color: #e6f2ff"] * len(row)
+        elif "출고불가" in status or "유통기한" in status:
+            return ["background-color: #fff9e6"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(highlight_rows, axis=1)
 
 # ============================================================
 # STREAMLIT UI
@@ -295,7 +322,7 @@ st.sidebar.header("⚙️ 설정 옵션")
 min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
 min_days_limit = int(min_months * 30.4375)
 
-# 수평 정렬 업로드 영역
+# 파일 업로드 동일 라인
 col1, col2 = st.columns(2)
 
 with col1:
@@ -314,7 +341,6 @@ with col2:
         help="※ .xls 업로드 오류 발생 시 Microsoft Excel 2007 버전으로 저장 후 업로드하세요."
     )
 
-# 자동 매핑 및 표출
 if wms_file and delivery_file:
     try:
         wms_raw = load_uploaded_file(wms_file)
@@ -344,7 +370,9 @@ if wms_file and delivery_file:
         status_filter = st.multiselect("상태별 필터링", result_df["매핑상태"].unique(), default=result_df["매핑상태"].unique())
         filtered_result = result_df[result_df["매핑상태"].isin(status_filter)]
 
-        st.dataframe(filtered_result, use_container_width=True, height=520)
+        # 색상 하이라이트가 포함된 표 출력
+        styled_result = style_dataframe(filtered_result)
+        st.dataframe(styled_result, use_container_width=True, height=520)
 
         # Excel 다운로드
         output = BytesIO()
@@ -371,12 +399,11 @@ st.markdown("---")
 # ============================================================
 with st.expander("📖 올리브영 자동 출고 매핑 프로그램 사용 방법 및 오류 해결 안내", expanded=False):
     st.markdown("""
-    ### 1. 주요 기능 및 자동 매핑 로직
-    * **자동 실행**: 두 파일을 올리는 즉시 전체 데이터가 자동 매핑되어 수량 및 LOT가 배정됩니다.
-    * **정상창고 재고만 출고**: WMS H열 창고명이 **'정상창고'**인 재고만 출고 대상 재고로 필터링합니다.
-    * **상품명 표시**: 재고 유무와 상관없이 **올리브영 납품확인서 기준의 상품명**이 항상 보입니다.
-    * **LOT 표시 예시**: `LOT명(현재창고재고: XX개)` 형태로 창고 잔여 수량을 명확히 표시합니다.
-    * **단일 LOT 우선 배정**: 출고 수량을 채울 수 있는 단일 LOT를 우선 매핑하며, 불가능할 때만 `⚠️ LOT 분할`로 처리됩니다.
+    ### 1. 주요 기능 및 색상 구분 안내
+    * **🔴 빨간색 배경**: 재고가 아예 없는 항목 (`🔴 재고없음`)
+    * **⚠️ 파란색 배경**: 단일 LOT로 수량이 부족하여 나누어 출고되는 항목 (`⚠️ LOT 분할`)
+    * **⛔ 노란색 배경**: 잔여 유통기한 1년 6개월(547일) 미만으로 올리브영 입고 불가한 항목 (`⛔ [출고불가] 유통기한 1년6개월 미만`)
+    * **`LOT (현재재고)` 표기**: `LOT명(현재창고보유수량)`으로 출력되어 잔여 재고 확인이 용이합니다.
 
     ---
 
