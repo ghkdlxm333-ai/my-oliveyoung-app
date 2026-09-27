@@ -8,7 +8,7 @@ import streamlit as st
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="올리브영 LOT 매핑 & 3PL 교차 검증기",
+    page_title="올리브영 출고 LOT자동 매핑 시스템(그레이스3PL)",
     page_icon="📦",
     layout="wide",
 )
@@ -229,6 +229,13 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
     wms_work = wms_df.copy()
     allocated_results = []
 
+    # 납품확인서 총 요구량 수집 (센터/바코드별 합계 검증용)
+    delivery_totals = delivery_df.copy()
+    delivery_totals["센터명"] = delivery_totals["센터"].apply(
+        lambda c: "양지온라인센터" if "양지온라인" in str(c) else ("양지센터" if "양지" in str(c) else ("경산센터" if "경산" in str(c) else str(c)))
+    )
+    delivery_totals_grp = delivery_totals.groupby(["센터명", "상품코드"])["출고수량"].sum().to_dict()
+
     for idx, d_row in delivery_df.iterrows():
         barcode = d_row.get("상품코드", "")
         req_qty = d_row.get("출고수량", 0)
@@ -239,16 +246,11 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
         if pd.isna(target_date):
             target_date = pd.Timestamp.now()
 
-        # Center classification
         raw_center = str(d_row.get("센터", "")).strip()
-        if "양지온라인" in raw_center:
-            center = "양지온라인센터"
-        elif "양지" in raw_center:
-            center = "양지센터"
-        elif "경산" in raw_center:
-            center = "경산센터"
-        else:
-            center = raw_center if raw_center else "기타센터"
+        if "양지온라인" in raw_center: center = "양지온라인센터"
+        elif "양지" in raw_center: center = "양지센터"
+        elif "경산" in raw_center: center = "경산센터"
+        else: center = raw_center if raw_center else "기타센터"
 
         # 바코드/SKU 매칭
         matched_wms = wms_work[(wms_work["바코드"] == barcode) | (wms_work["WMS상품코드"] == barcode)].copy()
@@ -267,7 +269,6 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
         if valid_wms.empty:
             if not invalid_wms.empty:
                 status = "INVALID_SHELF_LIFE"
-                # 유통기한 미달 항목도 LOT 및 유통기한 정보 수집
                 for _, inv_row in invalid_wms.iterrows():
                     exp_str = inv_row["유통기한"].strftime("%Y-%m-%d") if pd.notna(inv_row["유통기한"]) else "N/A"
                     picked_lots.append({
@@ -336,7 +337,7 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
         elif is_split or status == "SPLIT":
             status_flag = "⚠️ LOT 분할"
 
-        # 그레이스 3PL 파일과의 데이터 교차 검증
+        # 그레이스 3PL 교차 검증 (단일 행 및 센터/바코드 총량 복합 평가)
         grace_check = "-"
         if grace_confirm_df is not None and not grace_confirm_df.empty:
             g_match = grace_confirm_df[(grace_confirm_df["센터"] == center) & (grace_confirm_df["바코드"] == barcode)]
@@ -345,11 +346,18 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
             else:
                 g_qty = int(g_match.iloc[0]["출고수량"])
                 g_exp = str(g_match.iloc[0]["유통기한"])
+                total_req_for_barcode = delivery_totals_grp.get((center, barcode), req_qty)
+                
+                # 수량 검증: 개별행 일치 OR 해당 품목 총 발주량과 3PL 총 출고량 일치 시 인정
+                qty_matched = (int(req_qty) == g_qty) or (int(total_req_for_barcode) == g_qty)
+                
+                # 유통기한 검증
+                exp_matched = (sys_exp_str == g_exp) or (sys_exp_str == "-") or (g_exp == "")
                 
                 diffs = []
-                if int(req_qty) != g_qty:
+                if not qty_matched:
                     diffs.append(f"수량차이(시스템:{int(req_qty)} / 3PL:{g_qty})")
-                if sys_exp_str != g_exp and sys_exp_str != "-" and g_exp != "":
+                if not exp_matched:
                     diffs.append(f"유통기한차이(시스템:{sys_exp_str} / 3PL:{g_exp})")
                     
                 if not diffs:
@@ -396,14 +404,14 @@ def style_dataframe(df):
 # ============================================================
 # STREAMLIT UI
 # ============================================================
-st.title("📦 올리브영 LOT 매핑 & 3PL 교차 검증기")
+st.title("📦 올리브영 출고 LOT자동 매핑 시스템(그레이스3PL)")
 st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하고, 3PL 출고파일과 교차 검증합니다.")
 
 st.sidebar.header("⚙️ 설정 옵션")
 min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
 min_days_limit = int(min_months * 30.4375)
 
-# 3개 파일 업로드 수평 정렬
+# 3개 파일 업로드 영역
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -430,7 +438,7 @@ with col3:
         help="그레이스 3PL에서 송부받은 센터별 시트 분리 출고확인 파일입니다."
     )
 
-# 파일 업로드 즉시 자동 실행
+# 자동 매핑 및 교차 검증 실행
 if wms_file and delivery_file:
     try:
         wms_raw = load_uploaded_file(wms_file)
