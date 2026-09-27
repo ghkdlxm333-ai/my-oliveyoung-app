@@ -9,7 +9,7 @@ import streamlit as st
 # ============================================================
 st.set_page_config(
     page_title="올리브영 출고 LOT자동 매핑 시스템(그레이스3PL)",
-    page_icon="📦",
+    page_icon="🫒",
     layout="wide",
 )
 
@@ -229,7 +229,7 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
     wms_work = wms_df.copy()
     allocated_results = []
 
-    # 납품확인서 총 요구량 수집 (센터/바코드별 합계 검증용)
+    # 납품확인서 총 요구량 수집
     delivery_totals = delivery_df.copy()
     delivery_totals["센터명"] = delivery_totals["센터"].apply(
         lambda c: "양지온라인센터" if "양지온라인" in str(c) else ("양지센터" if "양지" in str(c) else ("경산센터" if "경산" in str(c) else str(c)))
@@ -337,7 +337,7 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
         elif is_split or status == "SPLIT":
             status_flag = "⚠️ LOT 분할"
 
-        # 그레이스 3PL 교차 검증 (단일 행 및 센터/바코드 총량 복합 평가)
+        # 그레이스 3PL 교차 검증
         grace_check = "-"
         if grace_confirm_df is not None and not grace_confirm_df.empty:
             g_match = grace_confirm_df[(grace_confirm_df["센터"] == center) & (grace_confirm_df["바코드"] == barcode)]
@@ -348,10 +348,7 @@ def allocate_inventory(delivery_df, wms_df, grace_confirm_df=None, min_days=MIN_
                 g_exp = str(g_match.iloc[0]["유통기한"])
                 total_req_for_barcode = delivery_totals_grp.get((center, barcode), req_qty)
                 
-                # 수량 검증: 개별행 일치 OR 해당 품목 총 발주량과 3PL 총 출고량 일치 시 인정
                 qty_matched = (int(req_qty) == g_qty) or (int(total_req_for_barcode) == g_qty)
-                
-                # 유통기한 검증
                 exp_matched = (sys_exp_str == g_exp) or (sys_exp_str == "-") or (g_exp == "")
                 
                 diffs = []
@@ -402,14 +399,23 @@ def style_dataframe(df):
     return df.style.apply(highlight_rows, axis=1)
 
 # ============================================================
-# STREAMLIT UI
+# SIDEBAR WITH OLIVE YOUNG LOGO
 # ============================================================
-st.title("📦 올리브영 출고 LOT자동 매핑 시스템(그레이스3PL)")
-st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하고, 3PL 출고파일과 교차 검증합니다.")
-
+# 올리브영 로고 배치
+st.sidebar.image(
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Olive_Young_Logo.svg/2560px-Olive_Young_Logo.svg.png",
+    use_column_width=True,
+)
+st.sidebar.markdown("---")
 st.sidebar.header("⚙️ 설정 옵션")
 min_months = st.sidebar.slider("올리브영 납품 가능 최소 유통기한 (개월)", 6, 24, 18, 1)
 min_days_limit = int(min_months * 30.4375)
+
+# ============================================================
+# STREAMLIT UI MAIN
+# ============================================================
+st.title("🫒 올리브영 출고 LOT자동 매핑 시스템(그레이스3PL)")
+st.caption("그레이스 WMS 정상창고 재고와 올리브영 납품확인서를 바코드 기반으로 자동 매핑하고, 3PL 출고파일과 교차 검증합니다.")
 
 # 3개 파일 업로드 영역
 col1, col2, col3 = st.columns(3)
